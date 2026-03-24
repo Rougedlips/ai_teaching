@@ -1,0 +1,7 @@
+PyQt5==5.15.10
+PyQt-Fluent-Widgets==1.6.6
+openai==1.51.0
+markdown==3.5.1
+rarfile==4.2
+py7zr==0.20.8
+requests==2.31.0

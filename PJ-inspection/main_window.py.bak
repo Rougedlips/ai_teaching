@@ -1,0 +1,1900 @@
+"""
+主窗口界面
+"""
+import os
+from datetime import datetime
+from PyQt5.QtWidgets import (
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QSplitter,
+    QTreeWidget,
+    QTreeWidgetItem,
+    QTextEdit,
+    QFileDialog,
+    QMessageBox,
+    QLabel,
+    QListWidget,
+    QListWidgetItem,
+    QProgressDialog,
+    QSizePolicy,
+    QGroupBox,
+    QScrollArea,
+    QSpacerItem,
+    QPlainTextEdit
+)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QRect
+from PyQt5.QtGui import QColor, QPainter, QTextFormat, QFont
+from qfluentwidgets import (
+    FluentWindow,
+    PrimaryPushButton,
+    ToolButton,
+    PushButton,
+    FluentIcon,
+    InfoBar,
+    InfoBarPosition,
+    CardWidget,
+    StrongBodyLabel,
+    SubtitleLabel
+)
+
+from functools import partial
+from config_manager import ConfigManager
+from review_manager import ReviewManager
+from api_client import APIClient
+from file_scanner import FileScanner
+from settings_dialog import SettingsDialog
+from archive_utils import (
+    extract_archive,
+    cleanup_temp_directory,
+    is_supported_archive,
+    ArchiveExtractionError
+)
+
+
+class LineNumberArea(QWidget):
+    """行号显示区域"""
+    def __init__(self, editor):
+        super().__init__(editor)
+        self.code_editor = editor
+
+    def sizeHint(self):
+        return QSize(self.code_editor.line_number_area_width(), 0)
+
+    def paintEvent(self, event):
+        self.code_editor.line_number_area_paint_event(event)
+
+
+class CodeEditor(QPlainTextEdit):
+    """带行号的代码编辑器"""
+    def __init__(self):
+        super().__init__()
+        self.line_number_area = LineNumberArea(self)
+        
+        self.blockCountChanged.connect(self.update_line_number_area_width)
+        self.updateRequest.connect(self.update_line_number_area)
+        
+        self.update_line_number_area_width(0)
+        
+        # 设置等宽字体
+        font = QFont("Consolas, Monaco, Courier New, monospace")
+        font.setPointSize(10)
+        self.setFont(font)
+        self.setReadOnly(True)
+
+    def line_number_area_width(self):
+        """计算行号区域宽度"""
+        digits = 1
+        max_num = max(1, self.blockCount())
+        while max_num >= 10:
+            max_num //= 10
+            digits += 1
+        
+        space = 10 + self.fontMetrics().horizontalAdvance('9') * digits
+        return space
+
+    def update_line_number_area_width(self, _):
+        """更新行号区域宽度"""
+        self.setViewportMargins(self.line_number_area_width(), 0, 0, 0)
+
+    def update_line_number_area(self, rect, dy):
+        """更新行号区域"""
+        if dy:
+            self.line_number_area.scroll(0, dy)
+        else:
+            self.line_number_area.update(0, rect.y(), self.line_number_area.width(), rect.height())
+        
+        if rect.contains(self.viewport().rect()):
+            self.update_line_number_area_width(0)
+
+    def resizeEvent(self, event):
+        """调整大小事件"""
+        super().resizeEvent(event)
+        
+        cr = self.contentsRect()
+        self.line_number_area.setGeometry(QRect(cr.left(), cr.top(), self.line_number_area_width(), cr.height()))
+
+    def line_number_area_paint_event(self, event):
+        """绘制行号"""
+        painter = QPainter(self.line_number_area)
+        painter.fillRect(event.rect(), QColor(240, 240, 240))
+        
+        block = self.firstVisibleBlock()
+        block_number = block.blockNumber()
+        top = int(self.blockBoundingGeometry(block).translated(self.contentOffset()).top())
+        bottom = top + int(self.blockBoundingRect(block).height())
+        
+        while block.isValid() and top <= event.rect().bottom():
+            if block.isVisible() and bottom >= event.rect().top():
+                number = str(block_number + 1)
+                painter.setPen(QColor(120, 120, 120))
+                painter.drawText(0, top, self.line_number_area.width() - 5, 
+                               self.fontMetrics().height(),
+                               Qt.AlignRight, number)
+            
+            block = block.next()
+            top = bottom
+            bottom = top + int(self.blockBoundingRect(block).height())
+            block_number += 1
+
+
+class ReviewThread(QThread):
+    """评审线程，避免阻塞UI"""
+
+    finished = pyqtSignal(str)
+    error = pyqtSignal(str)
+
+    def __init__(self, api_client, prompt, model_name):
+        super().__init__()
+        self.api_client = api_client
+        self.prompt = prompt
+        self.model_name = model_name
+
+    def run(self):
+        try:
+            result = self.api_client.call_api(self.prompt)
+            self.finished.emit(result)
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
+class MainWindow(FluentWindow):
+    SECTION_TITLE_MAP = {
+        'summary': '本项目组整体代码情况，代码质量和规范性的评价以及代码中AIGC的特征检测比率情况',
+        'functionality': '本阶段要求功能实现情况',
+        'suggestions': '本阶段实现的改进建议情况',
+        'score_breakdown': '本组代码评分组成',
+        'issues': '本组代码存在的代码错误、潜在问题以及代码风格问题'
+    }
+
+    def __init__(self, backend_client=None):
+        super().__init__()
+        self.backend_client = backend_client
+        self.config_manager = ConfigManager()
+        self.review_manager = ReviewManager()
+        self.current_workspace_label = None
+        self.current_workspace_source = None
+        self.workspace_origin_path = None
+        self.current_file_path = None
+        self.current_review_content = None
+        self.review_thread = None
+        self.temp_extracted_directory = None
+        self.is_archive_workspace = False
+        self.current_review_id = None
+        self.current_model_name = None
+
+        self.setWindowTitle('进阶式挑战性综合项目代码评审工具')
+        self.resize(1400, 860)
+
+        self.init_ui()
+        self.init_review_interface()
+        self.load_review_history()
+        
+        # 如果已登录，显示用户信息
+        if self.backend_client and self.backend_client.is_authenticated():
+            user_info = self.backend_client.get_user_info()
+            if user_info:
+                username = user_info.get('username', '未知用户')
+                role = user_info.get('role', 'student')
+                role_text = '教师' if role == 'teacher' else '学生'
+                self.show_success(f'欢迎回来，{username} ({role_text})')
+
+
+    # region UI 初始化
+    def init_ui(self):
+        """初始化工作台界面（空白页面）"""
+        self.workspace_widget = QWidget()
+        self.workspace_widget.setObjectName('workspaceInterface')
+        
+        main_layout = QVBoxLayout(self.workspace_widget)
+        main_layout.setContentsMargins(16, 16, 16, 16)
+        main_layout.setSpacing(12)
+        
+        # 用户信息显示（如果已登录）
+        if self.backend_client and self.backend_client.is_authenticated():
+            user_info = self.backend_client.get_user_info()
+            if user_info:
+                username = user_info.get('username', '未知用户')
+                role = user_info.get('role', 'student')
+                role_text = '教师' if role == 'teacher' else '学生'
+                
+                user_info_label = QLabel(f'👤 {username} ({role_text})')
+                user_info_label.setAlignment(Qt.AlignCenter)
+                user_info_label.setStyleSheet('color: #0078D7; font-size: 16px; margin-top: 50px; font-weight: bold;')
+                main_layout.addWidget(user_info_label)
+        
+        # 空白工作台 - 显示欢迎信息
+        welcome_label = SubtitleLabel('欢迎使用代码评审工具')
+        welcome_label.setAlignment(Qt.AlignCenter)
+        welcome_label.setStyleSheet('color: #666666; font-size: 24px; margin-top: 50px;')
+        
+        info_label = QLabel('请点击左侧"代码评审"图标开始使用')
+        info_label.setAlignment(Qt.AlignCenter)
+        info_label.setStyleSheet('color: #999999; font-size: 14px; margin-top: 20px;')
+        
+        main_layout.addWidget(welcome_label)
+        main_layout.addWidget(info_label)
+        main_layout.addStretch()
+        
+        # 添加工作台界面
+        self.addSubInterface(self.workspace_widget, FluentIcon.HOME, '工作台')
+        self.navigationInterface.setCurrentItem('workspaceInterface')
+
+    def init_review_interface(self):
+        """初始化评审界面"""
+        self.review_widget = QWidget()
+        self.review_widget.setObjectName('reviewInterface')
+
+        main_layout = QVBoxLayout(self.review_widget)
+        main_layout.setContentsMargins(16, 16, 16, 16)
+        main_layout.setSpacing(12)
+
+        # 顶部操作栏
+        action_layout = QHBoxLayout()
+        action_layout.setSpacing(12)
+
+        button_size_policy = QSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+
+        open_btn = PrimaryPushButton('📁 打开文件夹')
+        open_btn.setMinimumWidth(160)
+        open_btn.setSizePolicy(button_size_policy)
+        open_btn.clicked.connect(self.open_folder)
+
+        self.review_btn = PrimaryPushButton('🤖 开始评审')
+        self.review_btn.setMinimumWidth(160)
+        self.review_btn.setEnabled(False)
+        self.review_btn.setSizePolicy(button_size_policy)
+        self.review_btn.clicked.connect(self.start_review)
+
+        self.import_archive_btn = PushButton('📦 导入压缩包')
+        self.import_archive_btn.setMinimumWidth(160)
+        self.import_archive_btn.setSizePolicy(button_size_policy)
+        self.import_archive_btn.clicked.connect(self.import_archive)
+
+        action_layout.addWidget(open_btn)
+        action_layout.addWidget(self.import_archive_btn)
+        action_layout.addWidget(self.review_btn)
+        action_layout.addStretch()
+
+        export_btn = ToolButton(FluentIcon.DOWNLOAD)
+        export_btn.setToolTip('导出评审结果')
+        export_btn.clicked.connect(self.export_review_result)
+        
+        settings_btn = ToolButton(FluentIcon.SETTING)
+        settings_btn.setToolTip('设置')
+        settings_btn.clicked.connect(self.open_settings)
+
+        about_btn = ToolButton(FluentIcon.INFO)
+        about_btn.setToolTip('关于')
+        about_btn.clicked.connect(self.show_about)
+
+        action_layout.addWidget(export_btn)
+        action_layout.addWidget(settings_btn)
+        action_layout.addWidget(about_btn)
+
+        main_layout.addLayout(action_layout)
+
+        # 主水平分割器：左侧内容区域 vs 右侧评审区域
+        main_splitter = QSplitter(Qt.Horizontal)
+        main_splitter.setChildrenCollapsible(False)
+        main_splitter.setHandleWidth(10)
+
+        section_style = (
+            'QWidget#sectionCard { '
+            'background-color: rgba(255, 255, 255, 0.65);'
+            'border-radius: 12px;'
+            'border: 1px solid rgba(0, 0, 0, 0.04);'
+            '}'
+            'QWidget#sectionCard QLabel.sectionTitle { '
+            'font-weight: 600;'
+            'font-size: 15px;'
+            'padding-bottom: 4px;'
+            '}'
+            'QTreeWidget, QTextEdit, QListWidget { '
+            'border: 1px solid rgba(0, 0, 0, 0.08);'
+            'border-radius: 8px;'
+            'background-color: rgba(255, 255, 255, 0.9);'
+            'padding: 8px;'
+            '}'
+            'QListWidget::item { '
+            'border: 1px solid rgba(0, 0, 0, 0.08);'
+            'border-radius: 8px;'
+            'background-color: rgba(255, 255, 255, 0.9);'
+            'padding: 12px;'
+            'margin: 4px;'
+            '}'
+            'QListWidget::item:selected { '
+            'background-color: rgba(64, 158, 255, 0.15);'
+            'border: 2px solid rgba(64, 158, 255, 0.8);'
+            'color: #1976D2;'
+            'font-weight: bold;'
+            '}'
+            'QListWidget::item:hover { '
+            'background-color: rgba(64, 158, 255, 0.08);'
+            '}'
+        )
+        self.review_widget.setStyleSheet(section_style)
+
+        # 左侧内容区域
+        left_content_widget = QWidget()
+        left_content_layout = QVBoxLayout(left_content_widget)
+        left_content_layout.setContentsMargins(0, 0, 8, 0)
+        left_content_layout.setSpacing(0)
+
+        # 左侧水平分割器：文件树 vs 文件预览
+        left_splitter = QSplitter(Qt.Horizontal)
+        left_splitter.setChildrenCollapsible(False)
+        left_splitter.setHandleWidth(8)
+
+        # 左侧：文件树
+        left_widget = QWidget()
+        left_widget.setObjectName('sectionCard')
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.setContentsMargins(16, 16, 16, 16)
+        left_layout.setSpacing(12)
+
+        left_label = QLabel('项目文件:')
+        left_label.setObjectName('sectionTitle')
+        left_label.setProperty('class', 'sectionTitle')
+        left_label.setStyleSheet('font-weight: 600; font-size: 15px;')
+        left_layout.addWidget(left_label)
+
+        self.file_tree = QTreeWidget()
+        self.file_tree.setHeaderHidden(True)
+        self.file_tree.itemClicked.connect(self.on_file_selected)
+        self.file_tree.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        left_layout.addWidget(self.file_tree, stretch=1)
+
+        left_splitter.addWidget(left_widget)
+
+        # 右侧：文件预览
+        middle_widget = QWidget()
+        middle_widget.setObjectName('sectionCard')
+        middle_layout = QVBoxLayout(middle_widget)
+        middle_layout.setContentsMargins(16, 16, 16, 16)
+        middle_layout.setSpacing(12)
+
+        middle_label = QLabel('文件内容预览:')
+        middle_label.setObjectName('sectionTitle')
+        middle_label.setProperty('class', 'sectionTitle')
+        middle_label.setStyleSheet('font-weight: 600; font-size: 15px;')
+        middle_layout.addWidget(middle_label)
+
+        self.file_content = CodeEditor()
+        self.file_content.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        middle_layout.addWidget(self.file_content, stretch=1)
+
+        left_splitter.addWidget(middle_widget)
+        left_splitter.setStretchFactor(0, 1)
+        left_splitter.setStretchFactor(1, 2)
+
+        left_content_layout.addWidget(left_splitter, stretch=7)
+
+        # 评审历史（卡片式）
+        history_container = QWidget()
+        history_container.setObjectName('sectionCard')
+        history_layout = QVBoxLayout(history_container)
+        history_layout.setContentsMargins(16, 16, 16, 16)
+        history_layout.setSpacing(12)
+
+        history_label = QLabel('评审历史:')
+        history_label.setObjectName('sectionTitle')
+        history_label.setProperty('class', 'sectionTitle')
+        history_label.setStyleSheet('font-weight: 600; font-size: 15px;')
+        history_layout.addWidget(history_label)
+
+        self.history_list = QListWidget()
+        self.history_list.itemClicked.connect(self.on_history_selected)
+        self.history_list.setSelectionMode(QListWidget.SingleSelection)
+        self.history_list.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.history_list.setMinimumHeight(120)
+        self.history_list.setMaximumHeight(200)
+        history_layout.addWidget(self.history_list)
+
+        left_content_layout.addWidget(history_container, stretch=3)
+
+        main_splitter.addWidget(left_content_widget)
+
+        # 右侧：评审结果（占据整个右侧）
+        right_widget = QWidget()
+        right_widget.setObjectName('sectionCard')
+        right_layout = QVBoxLayout(right_widget)
+        right_layout.setContentsMargins(16, 16, 16, 16)
+        right_layout.setSpacing(12)
+
+ # 标题和分数水平布局
+        title_score_layout = QHBoxLayout()
+        title_score_layout.setSpacing(12)
+        
+        right_label = QLabel('评审结果:')
+        right_label.setObjectName('sectionTitle')
+        right_label.setProperty('class', 'sectionTitle')
+        right_label.setStyleSheet('font-weight: 600; font-size: 15px;')
+        title_score_layout.addWidget(right_label)
+        
+        # 分数显示标签
+        self.score_label = SubtitleLabel("等待评审")
+        self.score_label.setStyleSheet("color: #666666; font-size: 16px; font-weight: bold;")
+        title_score_layout.addWidget(self.score_label)
+        title_score_layout.addStretch()
+        
+        right_layout.addLayout(title_score_layout)
+
+        # 创建评审结果显示区域
+        self.review_result_widget = self.create_review_result_widget()
+        self.review_result_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+        self.review_scroll_area = QScrollArea()
+        self.review_scroll_area.setWidgetResizable(True)
+        self.review_scroll_area.setFrameShape(QScrollArea.NoFrame)
+        self.review_scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.review_scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.review_scroll_area.setWidget(self.review_result_widget)
+        self.review_scroll_area.setStyleSheet(
+            'QScrollArea { background-color: rgba(255, 255, 255, 1); border: none; }'
+            'QScrollArea > QWidget > QWidget { background-color: rgba(255, 255, 255, 1); }'
+            'QScrollBar:vertical { padding: 0px; background: transparent; width: 10px; }'
+            'QScrollBar::handle:vertical { background: rgba(120, 120, 120, 0.3); min-height: 24px; border-radius: 5px; }'
+            'QScrollBar::handle:vertical:hover { background: rgba(120, 120, 120, 0.5); }'
+            'QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }'
+            'QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }'
+            'QScrollBar:horizontal { height: 8px; background: transparent; }'
+            'QScrollBar::handle:horizontal { background: rgba(120, 120, 120, 0.3); min-width: 24px; border-radius: 4px; }'
+            'QScrollBar::handle:horizontal:hover { background: rgba(120, 120, 120, 0.5); }'
+            'QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0px; }'
+            'QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background: transparent; }'
+        )
+
+        right_layout.addWidget(self.review_scroll_area, stretch=1)
+
+        main_splitter.addWidget(right_widget)
+
+        main_splitter.setStretchFactor(0, 2)
+        main_splitter.setStretchFactor(1, 3)
+
+        main_layout.addWidget(main_splitter, stretch=1)
+
+        self.status_label = QLabel('就绪')
+        self.status_label.setStyleSheet('color: #666666; padding-top: 4px;')
+        self.status_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        main_layout.addWidget(self.status_label)
+
+        # 添加评审界面
+        self.addSubInterface(self.review_widget, FluentIcon.DOCUMENT, '代码评审')
+
+    # endregion
+
+    # region 事件处理
+    def open_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, '选择项目文件夹')
+        if folder:
+            self._cleanup_temp_workspace()
+            self.current_workspace_source = folder
+            self.workspace_origin_path = folder
+            self.current_workspace_label = os.path.basename(folder)
+            self.is_archive_workspace = False
+            self.load_file_tree(folder, display_name=self.current_workspace_label)
+            self.review_btn.setEnabled(True)
+            self.import_archive_btn.setEnabled(True)
+            self.show_status(f'已加载: {folder}')
+
+    def import_archive(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, 
+            '选择压缩包文件', 
+            '', 
+            '支持的压缩包 (*.zip *.rar);;ZIP 文件 (*.zip);;RAR 文件 (*.rar)'
+        )
+        if not file_path:
+            return
+            
+        if not is_supported_archive(file_path):
+            QMessageBox.warning(self, '警告', '不支持的压缩包格式，请选择 ZIP 或 RAR 文件')
+            return
+            
+        try:
+            self._cleanup_temp_workspace()
+            
+            self.show_status('正在解压压缩包...')
+            temp_dir, display_name = extract_archive(file_path)
+            
+            self.current_workspace_source = temp_dir
+            self.workspace_origin_path = file_path
+            self.current_workspace_label = display_name
+            self.temp_extracted_directory = temp_dir
+            self.is_archive_workspace = True
+            
+            self.load_file_tree(temp_dir, display_name=self.current_workspace_label)
+            self.review_btn.setEnabled(True)
+            self.import_archive_btn.setEnabled(True)
+            
+            self.show_success(f'压缩包已解压并加载: {display_name}')
+            
+        except ArchiveExtractionError as e:
+            QMessageBox.critical(self, '解压失败', f'压缩包解压失败:\n{str(e)}')
+            self.show_error('压缩包解压失败')
+        except Exception as e:
+            QMessageBox.critical(self, '错误', f'导入压缩包时发生错误:\n{str(e)}')
+            self.show_error('导入压缩包失败')
+
+    def _cleanup_temp_workspace(self):
+        if self.temp_extracted_directory:
+            try:
+                cleanup_temp_directory(self.temp_extracted_directory)
+                self.show_status('临时解压目录已清理')
+            except Exception as e:
+                self.show_error(f'清理临时目录失败: {e}')
+            finally:
+                self.temp_extracted_directory = None
+
+    def load_file_tree(self, folder_path, display_name=None):
+        self.file_tree.clear()
+        tree_data = FileScanner.get_file_tree(folder_path, display_name=display_name)
+
+        def add_tree_items(parent_item, node):
+            item = QTreeWidgetItem(parent_item)
+            item.setText(0, node['name'])
+            item.setData(0, Qt.UserRole, node['path'])
+            if node['is_dir']:
+                item.setIcon(0, self.style().standardIcon(self.style().SP_DirIcon))
+                for child in node['children']:
+                    add_tree_items(item, child)
+            else:
+                item.setIcon(0, self.style().standardIcon(self.style().SP_FileIcon))
+
+        root_item = QTreeWidgetItem(self.file_tree)
+        root_item.setText(0, tree_data['name'])
+        root_item.setData(0, Qt.UserRole, tree_data['path'])
+        root_item.setIcon(0, self.style().standardIcon(self.style().SP_DirIcon))
+
+        children = tree_data.get('children', [])
+        if isinstance(children, list):
+            for child in children:
+                add_tree_items(root_item, child)
+
+        root_item.setExpanded(True)
+
+    def on_file_selected(self, item, column):
+        file_path = item.data(0, Qt.UserRole)
+        if os.path.isfile(file_path):
+            self.current_file_path = file_path
+            try:
+                with open(file_path, 'r', encoding='utf-8', errors='ignore') as handle:
+                    content = handle.read()
+                    self.file_content.setPlainText(content)
+            except Exception as exc:
+                self.file_content.setPlainText(f'无法读取文件: {exc}')
+        else:
+            self.current_file_path = None
+            self.file_content.clear()
+
+    def start_review(self):
+        if not self.current_workspace_source:
+            QMessageBox.warning(self, '警告', '请先加载项目文件夹或压缩包')
+            return
+
+        use_deepseek = bool(self.config_manager.get('use_deepseek', True))
+        use_qwencoder = bool(self.config_manager.get('use_qwencoder', False))
+        use_doubao = bool(self.config_manager.get('use_doubao', False))
+
+        if not (use_deepseek or use_qwencoder or use_doubao):
+            use_deepseek = True
+
+        if use_doubao:
+            provider = 'doubao'
+        elif use_qwencoder:
+            provider = 'qwencoder'
+        else:
+            provider = 'deepseek'
+
+        if provider == 'doubao':
+            api_url = self.config_manager.get('doubao_api_url')
+            api_key = self.config_manager.get('doubao_api_key')
+            model_name = self.config_manager.get('doubao_model_name')
+            provider_label = 'DoubaoCoder'
+            if model_name and not model_name.lower().startswith('doubao'):
+                provider_label = f'DoubaoCoder ({model_name})'
+        elif provider == 'qwencoder':
+            api_url = self.config_manager.get('qwencoder_api_url')
+            api_key = self.config_manager.get('qwencoder_api_key')
+            model_name = self.config_manager.get('qwencoder_model_name')
+            provider_label = 'QwenCoder'
+        else:
+            api_url = self.config_manager.get('api_url')
+            api_key = self.config_manager.get('api_key')
+            model_name = self.config_manager.get('model_name')
+            provider_label = 'DeepSeek'
+
+        self.current_model_name = model_name
+
+        if not api_url or not api_key or not model_name:
+            reply = QMessageBox.question(
+                self,
+                '未配置',
+                f'{provider_label} API 配置不完整，是否前往设置？',
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if reply == QMessageBox.Yes:
+                self.open_settings()
+            return
+
+        progress = QProgressDialog('正在扫描项目文件...', '取消', 0, 0, self)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+
+        try:
+            scan_root = self.current_workspace_source
+            file_structure, code_files = FileScanner.scan_directory(scan_root)
+            
+            if not code_files:
+                progress.close()
+                QMessageBox.warning(self, '警告', '未找到可评审的代码文件')
+                return
+
+            code_content_parts = []
+            for file_path, content in code_files.items():
+                code_content_parts.append(
+                    f"""### 文件: {file_path}
+
+```
+{content}
+```
+"""
+                )
+            code_content = '\n'.join(code_content_parts)
+
+            prompt_template = self.config_manager.get('prompt_template')
+            functionality_checks = self.config_manager.get('functionality_checks', '')
+            
+            if not prompt_template:
+                progress.close()
+                QMessageBox.warning(self, '警告', '提示词模板未配置，请前往设置')
+                return
+                
+            prompt = prompt_template.format(
+                functionality_checks=functionality_checks
+            )
+            
+            # 附加文件结构和代码内容
+            prompt += f"\n\n### 项目结构\n{file_structure}\n\n### 代码内容\n{code_content}"
+
+            progress.setLabelText('正在调用API进行评审...')
+
+            api_client = APIClient(api_url, api_key, model_name)
+
+            self.review_thread = ReviewThread(api_client, prompt, model_name)
+            self.review_thread.finished.connect(self.on_review_finished)
+            self.review_thread.error.connect(self.on_review_error)
+
+            self.review_btn.setEnabled(False)
+            self.review_btn.setText('评审中...')
+
+            self.review_thread.start()
+            progress.close()
+        except Exception as exc:
+            progress.close()
+            self.review_btn.setEnabled(True)
+            self.review_btn.setText('🤖 开始评审')
+            self.show_error(f'评审失败: {exc}')
+
+    def parse_review_result(self, result, model_name=None):
+        """解析评审结果，提取分数、评语和建议"""
+        import json
+        import re
+
+        content = (result or "").strip()
+        if not content:
+            return self._empty_parsed_result()
+
+        structured = self._parse_structured_sections(content)
+        if structured:
+            return structured
+
+        if (model_name or '').lower().startswith('qwen'):
+            return self._parse_qwen_review(content)
+
+        return self._parse_generic_review(content)
+
+    def _empty_parsed_result(self):
+        """返回空的结果结构"""
+        return {
+            'score': None,
+            'errors': [],
+            'warnings': [],
+            'style_issues': [],
+            'full_comment': '',
+            'suggestions': '',
+            'score_breakdown': '',
+            'summary': '',
+            'functionality': '',
+            'suggestions': ''
+        }
+
+    def _parse_structured_sections(self, content: str) -> dict:
+        """解析结构化评审结果"""
+        import json
+        import re
+
+        # 找到最终评审回复的开始位置
+        final_reply_start = -1
+        
+        # 查找"本项目"开头的段落（通常是最终评审回复的开始）
+        lines = content.split('\n')
+        for i, line in enumerate(lines):
+            if line.strip().startswith('本项目') and '实现了' in line:
+                final_reply_start = i
+                break
+        
+        # 如果找到了最终评审回复，从那里开始解析
+        if final_reply_start != -1:
+            parsing_lines = lines[final_reply_start:]
+        else:
+            parsing_lines = lines
+        
+        # 定义章节标识
+        summary_content = []
+        functionality_content = []
+        suggestions_content = []
+        score_breakdown_content = []
+        issues_content = []
+        
+        current_section = None
+        
+        for line in parsing_lines:
+            line_stripped = line.strip()
+            
+            if not line_stripped:
+                continue
+            
+            # 检测章节标题
+            if line_stripped.startswith('本项目') and '实现了' in line_stripped:
+                current_section = 'summary'
+                summary_content.append(line_stripped)
+            elif line_stripped == '本阶段要求功能实现情况':
+                current_section = 'functionality'
+            elif line_stripped == '本阶段实现的改进建议情况':
+                current_section = 'suggestions'
+            elif '本组代码评分组成' in line_stripped:
+                # 可能是 "本组代码评分组成：" 或 "本组代码总分为：XX分，本组代码评分组成："
+                current_section = 'score_breakdown'
+                # 不添加这行，因为它是标题
+            elif '本组代码存在的代码错误、潜在问题以及代码风格问题' in line_stripped:
+                current_section = 'issues'
+            else:
+                # 收集内容到对应的章节
+                if current_section == 'summary':
+                    # 概述部分只收集到下一个章节之前
+                    summary_content.append(line_stripped)
+                elif current_section == 'functionality':
+                    functionality_content.append(line_stripped)
+                elif current_section == 'suggestions':
+                    suggestions_content.append(line_stripped)
+                elif current_section == 'score_breakdown':
+                    score_breakdown_content.append(line_stripped)
+                elif current_section == 'issues':
+                    issues_content.append(line_stripped)
+        
+        # 合并各章节内容
+        summary_text = '\n'.join(summary_content)
+        functionality_text = '\n'.join(functionality_content)
+        suggestions_text = '\n'.join(suggestions_content)
+        score_breakdown_text = '\n'.join(score_breakdown_content)
+        issues_text = '\n'.join(issues_content)
+        
+        # 完整评语 = 概述 + 功能实现
+        full_comment = '\n\n'.join(filter(None, [summary_text, functionality_text]))
+        
+        # 提取问题列表
+        errors = []
+        warnings = []
+        style_issues = []
+
+        if issues_text:
+            # 提取代码错误
+            errors_match = re.search(r'代码错误:\s*\[(.*?)\]', issues_text, re.DOTALL)
+            if errors_match:
+                errors_content = errors_match.group(1).strip()
+                errors = self._extract_comma_separated_list(errors_content)
+            
+            # 提取潜在问题
+            warnings_match = re.search(r'潜在问题:\s*\[(.*?)\]', issues_text, re.DOTALL)
+            if warnings_match:
+                warnings_content = warnings_match.group(1).strip()
+                warnings = self._extract_comma_separated_list(warnings_content)
+            
+            # 提取风格问题
+            style_match = re.search(r'风格问题:\s*\[(.*?)\]', issues_text, re.DOTALL)
+            if style_match:
+                style_content = style_match.group(1).strip()
+                style_issues = self._extract_comma_separated_list(style_content)
+
+        # 提取总分 - 从整个内容中查找"本组代码总分为：XX分"
+        score = None
+        total_score_match = re.search(r'本组代码总分为[：:]\s*(\d+)\s*分', '\n'.join(parsing_lines))
+        if total_score_match:
+            score = int(total_score_match.group(1))
+        elif score_breakdown_text:
+            # 如果没有找到总分，尝试从评分组成中计算
+            score_parts = re.findall(r'(\d+)分', score_breakdown_text)
+            if score_parts:
+                score = sum(int(s) for s in score_parts)
+
+        return {
+            'score': score,
+            'errors': errors,
+            'warnings': warnings,
+            'style_issues': style_issues,
+            'full_comment': full_comment,
+            'suggestions': suggestions_text,
+            'score_breakdown': score_breakdown_text,
+            'summary': summary_text
+        }
+
+    def _extract_comma_separated_list(self, text: str) -> list:
+        """从逗号分隔的文本中提取列表项"""
+        import re
+        
+        items = []
+        if not text:
+            return items
+        
+        # 移除外层引号
+        text = text.strip()
+        if (text.startswith('"') and text.endswith('"')) or (text.startswith("'") and text.endswith("'")):
+            text = text[1:-1]
+        
+        # 智能分割：处理引号内的逗号
+        current_item = ""
+        in_quotes = False
+        quote_char = None
+        
+        i = 0
+        while i < len(text):
+            char = text[i]
+            
+            # 处理引号
+            if char in ('"', "'") and (i == 0 or text[i-1] != ''):
+                if not in_quotes:
+                    in_quotes = True
+                    quote_char = char
+                elif char == quote_char:
+                    in_quotes = False
+                    quote_char = None
+                i += 1
+                continue
+            
+            # 处理逗号
+            if char == ',' and not in_quotes:
+                item = current_item.strip()
+                if item:
+                    # 移除item的引号
+                    if (item.startswith('"') and item.endswith('"')) or (item.startswith("'") and item.endswith("'")):
+                        item = item[1:-1]
+                    items.append(item)
+                current_item = ""
+                i += 1
+                continue
+            
+            current_item += char
+            i += 1
+        
+        # 添加最后一项
+        item = current_item.strip()
+        if item:
+            if (item.startswith('"') and item.endswith('"')) or (item.startswith("'") and item.endswith("'")):
+                item = item[1:-1]
+            items.append(item)
+        
+        return items
+
+    def _parse_qwen_review(self, content: str) -> dict:
+        import json
+        import re
+
+        score = None
+        errors = []
+        warnings = []
+        style_issues = []
+        suggestions_lines = []
+        score_breakdown_lines = []
+        full_comment_lines = []
+
+        json_payload = None
+
+        def _extract_items(raw_text: str) -> list[str]:
+            items = []
+            for raw_line in raw_text.splitlines():
+                segments = re.split(r'[；;]', raw_line)
+                for segment in segments:
+                    stripped_line = segment.strip()
+                    if not stripped_line:
+                        continue
+                    stripped_line = re.sub(r'^[\-\*\u2022•]+\s*', '', stripped_line)
+                    stripped_line = re.sub(r'^[\d]+[\.、\)\-:：\s]*', '', stripped_line)
+                    stripped_line = stripped_line.strip()
+                    if stripped_line.startswith('错误'):
+                        stripped_line = stripped_line.lstrip('错误：:')
+                    if stripped_line.startswith('潜在问题'):
+                        stripped_line = stripped_line.lstrip('潜在问题：:')
+                    if stripped_line.startswith('风格问题'):
+                        stripped_line = stripped_line.lstrip('风格问题：:')
+                    stripped_line = stripped_line.strip()
+                    if stripped_line:
+                        items.append(stripped_line)
+            return items
+
+        json_match = re.search(r'\{[\s\S]*\}\s*$', content)
+        if json_match:
+            json_text = json_match.group(0).strip()
+            cleaned_json_text = (
+                json_text
+                .replace('"', '"')
+                .replace('"', '"')
+                .replace(''', '"')
+                .replace(''', '"')
+                .replace('：', ':')
+                .replace('，', ',')
+            )
+            cleaned_json_text = re.sub(
+                r'(?<!")([A-Za-z0-9_]+)(?<!")\s*:',
+                lambda match: f'"{match.group(1)}":',
+                cleaned_json_text
+            )
+            try:
+                json_payload = json.loads(cleaned_json_text)
+                content = content[: json_match.start()].rstrip()
+            except json.JSONDecodeError:
+                json_payload = None
+
+        if json_payload:
+            score = json_payload.get('score')
+            errors = json_payload.get('errors') or []
+            warnings = json_payload.get('warnings') or []
+            style_issues = (
+                json_payload.get('styleissues')
+                or json_payload.get('style_issues')
+                or []
+            )
+
+            if isinstance(errors, str):
+                errors = [errors]
+            if isinstance(warnings, str):
+                warnings = [warnings]
+            if isinstance(style_issues, str):
+                style_issues = [style_issues]
+
+            full_comment_lines.append(content.strip())
+        else:
+            current_section = None
+            section_buffers = {
+                'quality': [],
+                'bugs': [],
+                'performance': [],
+                'aigc': [],
+                'score': [],
+                'errors': [],
+                'warnings': [],
+                'styles': []
+            }
+
+            for raw_line in content.splitlines():
+                stripped = raw_line.strip()
+                if not stripped:
+                    continue
+
+                lower_line = stripped.lower()
+                if '代码质量' in stripped:
+                    current_section = 'quality'
+                elif '潜在的bug' in stripped or '优先级最高的bug' in stripped:
+                    current_section = 'bugs'
+                elif '性能优化建议' in stripped or '性能建议' in stripped:
+                    current_section = 'performance'
+                elif 'aigc' in lower_line:
+                    current_section = 'aigc'
+                elif '代码评分' in stripped or '分数' in stripped:
+                    current_section = 'score'
+                elif any(keyword in lower_line for keyword in ['错误', '错误：', '错误:', 'errors', 'error list']):
+                    current_section = 'errors'
+                elif any(keyword in lower_line for keyword in ['潜在问题', '潜在风险', 'warnings']):
+                    current_section = 'warnings'
+                elif any(keyword in lower_line for keyword in ['风格问题', 'style issues', 'style problems']):
+                    current_section = 'styles'
+                elif stripped.startswith(('代码错误', '错误列表', '错误：', '错误:')):
+                    current_section = 'errors'
+                elif stripped.startswith(('潜在问题', '潜在风险', '潜在隐患')):
+                    current_section = 'warnings'
+                elif stripped.startswith(('代码风格问题', '风格问题', '风格建议')):
+                    current_section = 'styles'
+
+                if current_section:
+                    section_buffers[current_section].append(stripped)
+                else:
+                    full_comment_lines.append(stripped)
+
+            def _collect_lines(buffer_key):
+                merged = '\n'.join(section_buffers[buffer_key]).strip()
+                return merged
+
+            full_comment_lines.append(_collect_lines('quality'))
+            full_comment_lines.append(_collect_lines('bugs'))
+            full_comment_lines.append(_collect_lines('performance'))
+            full_comment_lines.append(_collect_lines('aigc'))
+
+            score_text = _collect_lines('score')
+            if score_text:
+                score_breakdown_lines.append(score_text)
+                score_match = re.search(r'(?:分数|得分|总得分)[:：]\s*(\d+)', score_text)
+                if score_match:
+                    score = int(score_match.group(1))
+
+            errors_text = _collect_lines('errors')
+            if errors_text:
+                errors = _extract_items(errors_text)
+
+            warnings_text = _collect_lines('warnings')
+            if warnings_text:
+                warnings = _extract_items(warnings_text)
+
+            styles_text = _collect_lines('styles')
+            if styles_text:
+                style_issues = _extract_items(styles_text)
+
+            suggestions_lines.extend(
+                _extract_items('
+'.join(section_buffers['bugs']))
+            )
+            suggestions_lines.extend(
+                _extract_items('
+'.join(section_buffers['performance']))
+            )
+
+        full_comment = '\n'.join(
+            line for line in full_comment_lines if line.strip()
+        )
+        if not suggestions_lines:
+            suggestions_lines.extend(_extract_items('
+'.join(section_buffers['bugs'])))
+            suggestions_lines.extend(_extract_items('
+'.join(section_buffers['performance'])))
+
+        suggestions = '\n'.join(
+            line for line in suggestions_lines if line.strip()
+        )
+        score_breakdown = '\n'.join(
+            line for line in score_breakdown_lines if line.strip()
+        )
+
+        return {
+            'score': score,
+            'errors': errors,
+            'warnings': warnings,
+            'style_issues': style_issues,
+            'full_comment': full_comment,
+            'suggestions': suggestions,
+            'score_breakdown': score_breakdown
+        }
+
+    def _parse_generic_review(self, content: str) -> dict:
+        import json
+        import re
+
+        score = None
+        errors = []
+        warnings = []
+        style_issues = []
+        suggestions = ''
+        score_breakdown = ''
+        json_payload = None
+
+        json_match = re.search(r'\{[\s\S]*\}\s*$', content)
+        if json_match:
+            json_text = json_match.group(0).strip()
+            normalized_json = (
+                json_text.replace('"', '"')
+                .replace('"', '"')
+                .replace(''', '"')
+                .replace(''', '"')
+                .replace('：', ':')
+                .replace('，', ',')
+            )
+            normalized_json = re.sub(
+                r'(?<!")([A-Za-z0-9_]+)(?<!")\s*:',
+                lambda match: f'"{match.group(1)}":',
+                normalized_json
+            )
+            try:
+                json_payload = json.loads(normalized_json)
+                content = content[: json_match.start()].rstrip()
+            except json.JSONDecodeError:
+                json_payload = None
+
+        if json_payload:
+            score = json_payload.get('score')
+            errors = json_payload.get('errors') or []
+            warnings = json_payload.get('warnings') or []
+            style_issues = (
+                json_payload.get('styleissues')
+                or json_payload.get('style_issues')
+                or []
+            )
+
+            if isinstance(errors, str):
+                errors = [errors]
+            if isinstance(warnings, str):
+                warnings = [warnings]
+            if isinstance(style_issues, str):
+                style_issues = [style_issues]
+
+        suggestions_match = re.search(
+            r'(?:改进建议|建议|优化)[:：](.*?)(?:
+
+|
+[0-9]|$)',
+            content,
+            re.DOTALL | re.IGNORECASE
+        )
+        if suggestions_match:
+            suggestions = suggestions_match.group(1).strip()
+
+        score_components = []
+        for pattern in (
+            r'(功能评分[：:][^
+]+)',
+            r'(代码质量[：:][^
+]+)',
+            r'(原创性分析[：:][^
+]+)'
+        ):
+            match = re.search(pattern, content)
+            if match:
+                component_text = match.group(1).strip()
+                if component_text not in score_components:
+                    score_components.append(component_text)
+
+        if score_components:
+            score_breakdown = '\n'.join(score_components)
+
+        if score is None:
+            total_score_match = re.search(r'(?:总分|总得分|分数|得分)[:：]\s*(\d+)', content)
+            if total_score_match:
+                score = int(total_score_match.group(1))
+
+        return {
+            'score': score,
+            'errors': errors,
+            'warnings': warnings,
+            'style_issues': style_issues,
+            'full_comment': content.strip(),
+            'suggestions': suggestions,
+            'score_breakdown': score_breakdown
+        }
+
+    def _build_score_line(self, label, score_value, detail_text):
+        value_str = '' if score_value is None else str(score_value).strip()
+        value_part = value_str if not value_str or value_str.endswith('分') else f"{value_str}分"
+
+        detail_str = ''
+        if detail_text:
+            if isinstance(detail_text, (list, tuple)):
+                detail_text = '，'.join(
+                    str(item).strip() for item in detail_text if str(item).strip()
+                )
+            elif isinstance(detail_text, dict):
+                detail_text = '，'.join(
+                    f"{str(key).strip()}: {str(value).strip()}"
+                    for key, value in detail_text.items()
+                    if str(value).strip()
+                )
+            detail_str = str(detail_text).strip()
+
+        if detail_str:
+            if not detail_str.startswith('（'):
+                detail_str = f'（{detail_str}）'
+            if not detail_str.endswith('）'):
+                detail_str = f'{detail_str.rstrip("）")}）'
+
+        return f"{label}：{value_part}{detail_str}".rstrip()
+
+    def create_issue_card(self, issue_text, issue_type="error"):
+        """创建问题卡片"""
+        card = CardWidget()
+        card.setBorderRadius(6)
+        card.setMinimumHeight(40)
+        
+        # 根据问题类型设置不同的背景色
+        if issue_type == "error":
+            card.setStyleSheet("CardWidget { background-color: #FFEBEE; border: 1px solid #F44336; }")
+        elif issue_type == "warning":
+            card.setStyleSheet("CardWidget { background-color: #FFF8E1; border: 1px solid #FF9800; }")
+        else:  # style issue
+            card.setStyleSheet("CardWidget { background-color: #F3E5F5; border: 1px solid #9C27B0; }")
+        
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(8, 6, 8, 6)
+        
+        label = StrongBodyLabel(issue_text)
+        label.setWordWrap(True)
+        label.setStyleSheet("font-size: 12px;")
+        layout.addWidget(label)
+        
+        return card
+    
+    def update_review_result_ui(self, parsed_result):
+        """更新评审结果UI"""
+        # 显示分数
+        if parsed_result['score'] is not None:
+            self.score_label.setText(f"{parsed_result['score']}/100")
+            # 根据分数设置颜色
+            if parsed_result['score'] >= 80:
+                self.score_label.setStyleSheet("color: #4CAF50; font-size: 16px; font-weight: bold;")
+            elif parsed_result['score'] >= 60:
+                self.score_label.setStyleSheet("color: #FF9800; font-size: 16px; font-weight: bold;")
+            else:
+                self.score_label.setStyleSheet("color: #F44336; font-size: 16px; font-weight: bold;")
+        else:
+            self.score_label.setText("等待评审")
+            self.score_label.setStyleSheet("color: #666666; font-size: 16px; font-weight: bold;")
+        
+        # 显示完整评语 - 显示整体代码情况和功能实现情况
+        if parsed_result.get('full_comment'):
+            self.comment_text.setPlainText(parsed_result['full_comment'])
+            self.comment_widget.show()
+        else:
+            self.comment_widget.hide()
+
+        # 显示评分组成
+        score_breakdown_text = parsed_result.get('score_breakdown')
+        if score_breakdown_text:
+            self.score_breakdown_label.setText(score_breakdown_text)
+        else:
+            self.score_breakdown_label.setText('暂无评分组成信息')
+        self.score_breakdown_widget.show()  # 始终显示评分组成组件
+        
+        # 显示改进建议情况
+        suggestions_text = parsed_result.get('suggestions')
+        if suggestions_text:
+            self.suggestion_text.setPlainText(suggestions_text)
+            self.suggestion_widget.show()
+        else:
+            self.suggestion_widget.hide()
+        
+        # 更新错误折叠栏
+        errors = parsed_result.get('errors') or []
+        errors_count = len(errors)
+        self.errors_group.setTitle(f"代码错误 ({errors_count})")
+        
+        # 清空现有错误卡片
+        for i in reversed(range(self.errors_container_layout.count())):
+            child = self.errors_container_layout.itemAt(i).widget()
+            if child:
+                child.setParent(None)
+        
+        # 添加新的错误卡片
+        for error in errors:
+            error_card = self.create_issue_card(error, "error")
+            self.errors_container_layout.addWidget(error_card)
+        
+        # 更新警告折叠栏
+        warnings = parsed_result.get('warnings') or []
+        warnings_count = len(warnings)
+        self.warnings_group.setTitle(f"潜在问题 ({warnings_count})")
+        
+        # 清空现有警告卡片
+        for i in reversed(range(self.warnings_container_layout.count())):
+            child = self.warnings_container_layout.itemAt(i).widget()
+            if child:
+                child.setParent(None)
+        
+        # 添加新的警告卡片
+        for warning in warnings:
+            warning_card = self.create_issue_card(warning, "warning")
+            self.warnings_container_layout.addWidget(warning_card)
+        
+        # 更新代码风格问题折叠栏
+        style_issues = parsed_result.get('style_issues') or []
+        style_issues_count = len(style_issues)
+        self.style_issues_group.setTitle(f"代码风格问题 ({style_issues_count})")
+        
+        # 清空现有风格问题卡片
+        for i in reversed(range(self.style_issues_container_layout.count())):
+            child = self.style_issues_container_layout.itemAt(i).widget()
+            if child:
+                child.setParent(None)
+        
+        # 添加新的风格问题卡片
+        for style_issue in style_issues:
+            style_card = self.create_issue_card(style_issue, "style")
+            self.style_issues_container_layout.addWidget(style_card)
+        
+        # 如果有任何问题，展开对应的折叠栏
+        if errors_count > 0:
+            self.errors_group.setChecked(True)
+        if warnings_count > 0:
+            self.warnings_group.setChecked(True)
+        if style_issues_count > 0:
+            self.style_issues_group.setChecked(True)
+
+    def on_review_finished(self, result):
+        self.current_review_content = result
+        
+        try:
+            # 解析评审结果并更新UI
+            parsed_result = self.parse_review_result(result, model_name=self.current_model_name)
+            self.update_review_result_ui(parsed_result)
+
+            review_id, md_path = self.review_manager.save_review(
+                self.workspace_origin_path,
+                self.current_workspace_source or '',
+                result,
+                display_name=self.current_workspace_label,
+                model_name=self.current_model_name
+            )
+            if review_id:
+                self.show_status(f'评审完成，已保存到: {md_path}')
+                self.show_success('代码评审完成！')
+                self.load_review_history()
+                # 高亮新创建的评审记录
+                self.highlight_review_item(review_id)
+            else:
+                self.show_error('评审结果保存失败')
+        except Exception as e:
+            print(f"处理评审结果时出错: {e}")
+            self.on_review_error(f"处理评审结果时出错: {str(e)}")
+
+        self.review_btn.setEnabled(True)
+        self.review_btn.setText('🤖 开始评审')
+
+    def on_review_error(self, error_msg):
+        # 显示错误信息在评审结果区域
+        self.score_label.setText("评审失败")
+        self.score_label.setStyleSheet("color: #F44336; font-size: 16px; font-weight: bold;")
+        
+        self.comment_text.setPlainText(f"评审过程中发生错误:
+{error_msg}")
+        self.comment_widget.show()
+        
+        self.suggestion_widget.hide()
+        self.score_breakdown_widget.hide()  # 错误时隐藏评分组成
+        
+        # 重置问题计数
+        self.errors_group.setTitle("代码错误 (0)")
+        self.warnings_group.setTitle("潜在问题 (0)")  
+        self.style_issues_group.setTitle("代码风格问题 (0)")
+        
+        # 清空问题卡片
+        for i in reversed(range(self.errors_container_layout.count())):
+            child = self.errors_container_layout.itemAt(i).widget()
+            if child:
+                child.setParent(None)
+        
+        for i in reversed(range(self.warnings_container_layout.count())):
+            child = self.warnings_container_layout.itemAt(i).widget()
+            if child:
+                child.setParent(None)
+                
+        for i in reversed(range(self.style_issues_container_layout.count())):
+            child = self.style_issues_container_layout.itemAt(i).widget()
+            if child:
+                child.setParent(None)
+        
+        self.review_btn.setEnabled(True)
+        self.review_btn.setText('🤖 开始评审')
+        self.show_error(f'评审失败: {error_msg}')
+
+    def load_review_history(self):
+        self.history_list.clear()
+        self.current_review_id = None  # 重置当前评审ID
+        
+        for review in self.review_manager.get_all_reviews():
+            archive_or_folder_name = (
+                review.get('archive_name')
+                or review.get('display_name')
+                or review.get('folder_name')
+            )
+            review_time = review.get('datetime')
+            if not review_time and review.get('timestamp'):
+                try:
+                    review_time = datetime.strptime(review['timestamp'], '%Y%m%d_%H%M%S').strftime(
+                        '%Y-%m-%d %H:%M:%S'
+                    )
+                except ValueError:
+                    review_time = review['timestamp']
+            if not review_time:
+                review_time = '未知评审时间'
+
+            item = QListWidgetItem()
+            item.setData(Qt.UserRole, review['id'])
+            item.setData(Qt.UserRole + 1, archive_or_folder_name)
+            item.setData(Qt.UserRole + 3, review.get('model_name', ''))
+            item.setData(Qt.UserRole + 2, review.get('folder_path'))
+            if review.get('folder_path'):
+                item.setToolTip(review['folder_path'])
+            item.setSizeHint(QSize(220, 80))
+
+            model_name = review.get('model_name') or '未知模型'
+            item_widget = self._create_history_item_widget(
+                title_text=f"{archive_or_folder_name} by-{model_name}",
+                subtitle_text=review_time,
+                review_id=review['id']
+            )
+
+            self.history_list.addItem(item)
+            self.history_list.setItemWidget(item, item_widget)
+
+    def _create_history_item_widget(self, title_text: str, subtitle_text: str, review_id: str) -> QWidget:
+        widget = QWidget()
+        widget.setObjectName('historyListItem')
+        layout = QHBoxLayout(widget)
+        layout.setContentsMargins(12, 6, 8, 6)
+        layout.setSpacing(8)
+
+        text_container = QWidget()
+        text_layout = QVBoxLayout(text_container)
+        text_layout.setContentsMargins(0, 0, 0, 0)
+        text_layout.setSpacing(4)
+
+        display_title = f'📦 {title_text}' if title_text else '📦 未知名称'
+        display_subtitle = f'📅 {subtitle_text}' if subtitle_text else '📅 未知时间'
+
+        title_label = StrongBodyLabel(display_title)
+        title_label.setStyleSheet('font-size: 14px;')
+
+        subtitle_label = QLabel(display_subtitle)
+        subtitle_label.setStyleSheet('color: #666666; font-size: 12px;')
+
+        text_layout.addWidget(title_label)
+        text_layout.addWidget(subtitle_label)
+        text_layout.addStretch()
+
+        layout.addWidget(text_container)
+        layout.addStretch()
+
+        delete_button = ToolButton(FluentIcon.DELETE)
+        delete_button.setToolTip('删除此评审记录')
+        delete_button.clicked.connect(partial(self.confirm_delete_review, review_id))
+        layout.addWidget(delete_button, alignment=Qt.AlignRight | Qt.AlignVCenter)
+
+        return widget
+
+    def on_history_selected(self, item):
+        # 记录当前选中的评审ID
+        self.current_review_id = item.data(Qt.UserRole)
+        
+        content = self.review_manager.get_review_content(self.current_review_id)
+        if content:
+            self.current_review_content = content
+            # 解析评审结果并更新UI
+            parsed_result = self.parse_review_result(content)
+            self.update_review_result_ui(parsed_result)
+            display_title = item.data(Qt.UserRole + 1) or '历史评审记录'
+            self.show_status(f'已加载历史评审记录: {display_title}')
+        else:
+            self.current_review_content = None
+            QMessageBox.warning(self, '警告', '无法加载评审记录')
+
+    def confirm_delete_review(self, review_id: str) -> None:
+        reply = QMessageBox.question(
+            self,
+            '删除评审记录',
+            '确定要删除该评审历史记录吗？此操作不可撤销。',
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply == QMessageBox.Yes:
+            self.delete_review(review_id)
+
+    def delete_review(self, review_id: str) -> None:
+        if not self.review_manager.delete_review(review_id):
+            QMessageBox.warning(self, '警告', '删除评审记录失败')
+            return
+
+        for index in range(self.history_list.count() - 1, -1, -1):
+            item = self.history_list.item(index)
+            if item.data(Qt.UserRole) == review_id:
+                self.history_list.takeItem(index)
+                break
+
+        if self.current_review_id == review_id:
+            self.current_review_id = None
+            self.current_review_content = None
+            self.score_label.setText('等待评审')
+            self.score_label.setStyleSheet('color: #666666; font-size: 16px; font-weight: bold;')
+            self.comment_widget.hide()
+            self.suggestion_widget.hide()
+            self.score_breakdown_label.setText('暂无评分组成信息')
+            self.score_breakdown_widget.show()  # 重置时显示评分组成组件
+            self.errors_group.setTitle('代码错误 (0)')
+            self.warnings_group.setTitle('潜在问题 (0)')
+            self.style_issues_group.setTitle('代码风格问题 (0)')
+            for container_layout in (
+                self.errors_container_layout,
+                self.warnings_container_layout,
+                self.style_issues_container_layout,
+            ):
+                for layout_index in reversed(range(container_layout.count())):
+                    child_widget = container_layout.itemAt(layout_index).widget()
+                    if child_widget:
+                        child_widget.setParent(None)
+
+        self.show_success('评审记录已删除')
+
+    def highlight_review_item(self, review_id):
+        """高亮显示指定的评审记录"""
+        for i in range(self.history_list.count()):
+            item = self.history_list.item(i)
+            if item.data(Qt.UserRole) == review_id:
+                self.history_list.setCurrentItem(item)
+                self.current_review_id = review_id
+                self.history_list.scrollToItem(item)  # 滚动到该项
+                break
+
+    def open_settings(self):
+        dialog = SettingsDialog(self.config_manager, self)
+        dialog.exec_()
+
+    def create_review_result_widget(self):
+        """创建评审结果显示组件"""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+
+        card_style = (
+            "CardWidget { "
+            "background-color: rgba(255, 255, 255, 1);"
+            "border: 1px solid rgba(0, 0, 0, 0.04);"
+            "}"
+        )
+        
+        # 完整评语显示区域
+        self.comment_widget = CardWidget()
+        self.comment_widget.setBorderRadius(8)
+        self.comment_widget.setStyleSheet(card_style)
+        comment_layout = QVBoxLayout(self.comment_widget)
+        
+        comment_title = StrongBodyLabel("完整评语:")
+        comment_layout.addWidget(comment_title)
+        
+        self.comment_text = QTextEdit()
+        self.comment_text.setReadOnly(True)
+        self.comment_text.setMaximumHeight(200)
+        comment_layout.addWidget(self.comment_text)
+        
+        layout.addWidget(self.comment_widget)
+
+        # 评分组成显示区域
+        self.score_breakdown_widget = CardWidget()
+        self.score_breakdown_widget.setBorderRadius(8)
+        self.score_breakdown_widget.setStyleSheet(card_style)
+        score_breakdown_layout = QVBoxLayout(self.score_breakdown_widget)
+
+        score_breakdown_title = StrongBodyLabel("评分组成:")
+        score_breakdown_layout.addWidget(score_breakdown_title)
+
+        self.score_breakdown_label = QLabel("暂无评分组成信息")
+        self.score_breakdown_label.setWordWrap(True)
+        self.score_breakdown_label.setStyleSheet('color: #333333; font-size: 12px; line-height: 18px;')
+        score_breakdown_layout.addWidget(self.score_breakdown_label)
+
+        layout.addWidget(self.score_breakdown_widget)
+        
+        # 改进建议显示区域
+        self.suggestion_widget = CardWidget()
+        self.suggestion_widget.setBorderRadius(8)
+        self.suggestion_widget.setStyleSheet(card_style)
+        suggestion_layout = QVBoxLayout(self.suggestion_widget)
+        
+        suggestion_title = StrongBodyLabel("改进建议情况:")
+        suggestion_layout.addWidget(suggestion_title)
+        
+        self.suggestion_text = QTextEdit()
+        self.suggestion_text.setReadOnly(True)
+        self.suggestion_text.setMaximumHeight(120)
+        suggestion_layout.addWidget(self.suggestion_text)
+        
+        layout.addWidget(self.suggestion_widget)
+        
+        # 代码问题折叠区域 - 始终显示
+        self.issues_widget = CardWidget()
+        self.issues_widget.setBorderRadius(8)
+        self.issues_widget.setStyleSheet(card_style)
+        issues_layout = QVBoxLayout(self.issues_widget)
+        issues_layout.setContentsMargins(12, 12, 12, 12)
+        issues_layout.setSpacing(12)
+        
+        group_style = (
+            "QGroupBox { "
+            "background-color: rgba(255, 255, 255, 1);"
+            "border: 1px solid rgba(0, 0, 0, 0.04);"
+            "border-radius: 8px;"
+            "margin: 0;"
+            "padding: 16px 16px 12px 16px;"
+            "font-weight: 600;"
+            "color: #333333;"
+            "}"
+            "QGroupBox::title { "
+            "subcontrol-origin: padding;"
+            "subcontrol-position: top left;"
+            "padding: 0 8px;"
+            "margin-top: 0;"
+            "background-color: transparent;"
+            "}"
+        )
+        
+        # 错误折叠组件
+        self.errors_group = QGroupBox("代码错误 (0)")
+        self.errors_group.setCheckable(True)
+        self.errors_group.setChecked(False)  # 默认折叠
+        self.errors_group.setStyleSheet(group_style)
+        self.errors_layout = QVBoxLayout(self.errors_group)
+        self.errors_layout.setContentsMargins(0, 24, 0, 0)
+        self.errors_layout.setSpacing(8)
+        self.errors_container = QWidget()
+        self.errors_container_layout = QVBoxLayout(self.errors_container)
+        self.errors_container_layout.setContentsMargins(0, 0, 0, 0)
+        self.errors_layout.addWidget(self.errors_container)
+        issues_layout.addWidget(self.errors_group)
+        
+        # 警告折叠组件
+        self.warnings_group = QGroupBox("潜在问题 (0)")
+        self.warnings_group.setCheckable(True)
+        self.warnings_group.setChecked(False)
+        self.warnings_group.setStyleSheet(group_style)
+        self.warnings_layout = QVBoxLayout(self.warnings_group)
+        self.warnings_layout.setContentsMargins(0, 24, 0, 0)
+        self.warnings_layout.setSpacing(8)
+        self.warnings_container = QWidget()
+        self.warnings_container_layout = QVBoxLayout(self.warnings_container)
+        self.warnings_container_layout.setContentsMargins(0, 0, 0, 0)
+        self.warnings_layout.addWidget(self.warnings_container)
+        issues_layout.addWidget(self.warnings_group)
+        
+        # 代码风格问题折叠组件
+        self.style_issues_group = QGroupBox("代码风格问题 (0)")
+        self.style_issues_group.setCheckable(True)
+        self.style_issues_group.setChecked(False)
+        self.style_issues_group.setStyleSheet(group_style)
+        self.style_issues_layout = QVBoxLayout(self.style_issues_group)
+        self.style_issues_layout.setContentsMargins(0, 24, 0, 0)
+        self.style_issues_layout.setSpacing(8)
+        self.style_issues_container = QWidget()
+        self.style_issues_container_layout = QVBoxLayout(self.style_issues_container)
+        self.style_issues_container_layout.setContentsMargins(0, 0, 0, 0)
+        self.style_issues_layout.addWidget(self.style_issues_container)
+        issues_layout.addWidget(self.style_issues_group)
+        
+        layout.addWidget(self.issues_widget)
+        layout.addStretch()
+
+        spacer = QSpacerItem(20, 20, QSizePolicy.Minimum, QSizePolicy.Expanding)
+        layout.addItem(spacer)
+
+        widget.setStyleSheet('background-color: rgba(255, 255, 255, 1);')
+        widget.setProperty('class', 'reviewResultRoot')
+        widget.style().unpolish(widget)
+        widget.style().polish(widget)
+        
+        # 初始化时隐藏评语、建议组件，但显示评分组成和问题区域
+        self.comment_widget.hide()
+        self.suggestion_widget.hide()
+        self.score_breakdown_label.setText('暂无评分组成信息')
+        self.score_breakdown_widget.show()  # 评分组成组件始终显示
+        # issues_widget始终显示
+        
+        return widget
+
+    def export_review_result(self):
+        """导出当前显示的评审结果为Markdown文件"""
+        if not getattr(self, 'current_review_content', None):
+            if self.current_review_id:
+                cached = self.review_manager.get_review_content(self.current_review_id)
+                if cached:
+                    self.current_review_content = cached
+            if not self.current_review_content:
+                self.show_warning('没有可导出的评审结果')
+                return
+        
+        # 获取保存路径
+        folder_name = (
+            self.current_workspace_label
+            or os.path.basename(self.current_workspace_source or '')
+            or '评审结果'
+        )
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        default_filename = f"{folder_name}_{timestamp}.md"
+        
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            '导出评审结果',
+            default_filename,
+            'Markdown文件 (*.md)'
+        )
+        
+        if not file_path:
+            return  # 用户取消了保存
+        
+        try:
+            # 解析当前评审结果
+            parsed_result = self.parse_review_result(self.current_review_content)
+            
+            # 生成Markdown内容
+            md_content = self.generate_markdown_content(parsed_result, folder_name)
+            
+            # 写入文件
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(md_content)
+            
+            self.show_success(f'评审结果已导出到: {file_path}')
+            
+        except Exception as e:
+            self.show_error(f'导出失败: {str(e)}')
+    
+    def generate_markdown_content(self, parsed_result, folder_name):
+        """生成Markdown格式的评审内容"""
+        content = []
+        
+        # 标题和基本信息
+        content.append("# 代码评审报告")
+        content.append("")
+        content.append(f"**项目名称**: {folder_name}")
+        content.append(f"**评审时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        content.append("")
+        content.append("---")
+        content.append("")
+        
+        # 评分
+        if parsed_result['score'] is not None:
+            content.append("## 📊 评审评分")
+            content.append("")
+            content.append(f"**总分**: {parsed_result['score']}/100")
+            content.append("")
+            
+            # 评分等级说明
+            if parsed_result['score'] >= 80:
+                grade = "优秀 🌟"
+            elif parsed_result['score'] >= 60:
+                grade = "良好 👍"
+            else:
+                grade = "需要改进 ⚠️"
+            content.append(f"**等级**: {grade}")
+            content.append("")
+        
+        # 评语
+        comment_text = (
+            parsed_result.get('full_comment')
+            or parsed_result.get('comment')
+            or ''
+        )
+        if comment_text.strip():
+            content.append("## 📝 评审评语")
+            content.append("")
+            content.append(comment_text.strip())
+            content.append("")
+        
+        # 改进建议
+        suggestions_text = parsed_result.get('suggestions') or ''
+        if suggestions_text.strip():
+            content.append("## 💡 改进建议")
+            content.append("")
+            content.append(suggestions_text.strip())
+            content.append("")
+        
+        # 代码问题
+        has_issues = False
+        
+        # 错误
+        if parsed_result['errors']:
+            has_issues = True
+            content.append("## ❌ 代码错误")
+            content.append("")
+            for i, error in enumerate(parsed_result['errors'], 1):
+                content.append(f"{i}. {error}")
+            content.append("")
+        
+        # 警告
+        if parsed_result['warnings']:
+            has_issues = True
+            content.append("## ⚠️ 潜在问题")
+            content.append("")
+            for i, warning in enumerate(parsed_result['warnings'], 1):
+                content.append(f"{i}. {warning}")
+            content.append("")
+        
+        # 代码风格问题
+        if parsed_result['style_issues']:
+            has_issues = True
+            content.append("## 🎨 代码风格问题")
+            content.append("")
+            for i, style_issue in enumerate(parsed_result['style_issues'], 1):
+                content.append(f"{i}. {style_issue}")
+            content.append("")
+        
+        if not has_issues:
+            content.append("## ✅ 代码质量")
+            content.append("")
+            content.append("未发现明显问题，代码质量良好！")
+            content.append("")
+        
+        # 页脚
+        content.append("---")
+        content.append("")
+        content.append("*本报告由代码评审工具自动生成*")
+        
+        return "
+".join(content)
+
+    def show_about(self):
+        QMessageBox.about(
+            self,
+            '关于',
+            '<h2>代码评审工具</h2>'
+            '<p>版本: 1.0.0</p>'
+            '<p>一个基于PyQt5与Fluent设计语言的本地代码评审工具</p>'
+            '<p>支持调用大模型API对项目代码进行智能评审</p>'
+            '<p><br>功能特性:</p>'
+            '<ul>'
+            '<li>📁 文件夹浏览和目录树展示</li>'
+            '<li>📄 文件内容预览</li>'
+            '<li>🤖 大模型API代码评审</li>'
+            '<li>📝 评审历史记录管理</li>'
+            '<li>⚙️ 自定义API配置和提示词</li>'
+            '</ul>'
+        )
+    # endregion
+
+    def closeEvent(self, event):
+        self._cleanup_temp_workspace()
+        event.accept()
+
+    # region 辅助方法
+    def show_status(self, message: str):
+        if hasattr(self, 'status_label') and self.status_label:
+            self.status_label.setText(message)
+
+    def show_success(self, message: str):
+        InfoBar.success(
+            title='成功',
+            content=message,
+            duration=3000,
+            position=InfoBarPosition.TOP_RIGHT,
+            parent=self
+        )
+
+    def show_error(self, message: str):
+        InfoBar.error(
+            title='错误',
+            content=message,
+            duration=4000,
+            position=InfoBarPosition.TOP_RIGHT,
+            parent=self
+        )
+
+    def show_warning(self, message: str):
+        InfoBar.warning(
+            title='提示',
+            content=message,
+            duration=3000,
+            position=InfoBarPosition.TOP_RIGHT,
+            parent=self
+        )
+    # endregion
