@@ -82,6 +82,11 @@
               <el-menu-item v-if="!teacherClassList.length" index="/report-management">暂无本学期班级</el-menu-item>
             </el-sub-menu>
 
+            <el-menu-item v-if="userRole === 'teacher'" index="/project-selection">
+              <el-icon><Files /></el-icon>
+              <span>综合项目选题管理</span>
+            </el-menu-item>
+
             <el-menu-item v-if="userRole === 'admin'" index="/admin-center">
               <el-icon><Setting /></el-icon>
               <span>管理员中心</span>
@@ -120,7 +125,7 @@
             </el-sub-menu>
             <el-menu-item index="/group-manager">
               <el-icon><UserFilled /></el-icon>
-              <span>我的组队</span>
+              <span>综合项目申请管理</span>
             </el-menu-item>
             <el-menu-item index="/profile">
               <el-icon><DataAnalysis /></el-icon>

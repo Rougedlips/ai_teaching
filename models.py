@@ -193,3 +193,69 @@ class ClassTeamMember(Base):
     student_id = Column(Integer, ForeignKey("users.id"), nullable=False)
 
 
+# ================= 综合项目组队申请体系 =================
+class ProjectTopic(Base):
+    __tablename__ = "project_topics"
+
+    id = Column(Integer, primary_key=True, index=True)
+    semester_id = Column(Integer, ForeignKey("semesters.id"), nullable=False, index=True)
+    title = Column(String(200), nullable=False)
+    teacher_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    materials = Column(Text, nullable=True)
+    attachment_path = Column(String, nullable=True)
+    direction = Column(String(100), nullable=False)
+    is_published = Column(Boolean, default=False, nullable=False)
+    created_by = Column(String(20), nullable=False, default="teacher")
+    created_at = Column(TIMESTAMP(timezone=True), server_default=func.now(), nullable=False)
+
+
+class ProjectApplicationSetting(Base):
+    __tablename__ = "project_application_settings"
+
+    id = Column(Integer, primary_key=True, index=True)
+    semester_id = Column(Integer, ForeignKey("semesters.id"), nullable=False, unique=True, index=True)
+    is_enabled = Column(Boolean, default=False, nullable=False)
+    open_start = Column(String(20), nullable=True)
+    open_end = Column(String(20), nullable=True)
+    min_team_size = Column(Integer, default=2, nullable=False)
+    max_team_size = Column(Integer, default=6, nullable=False)
+
+
+class ProjectClassTopicConfig(Base):
+    __tablename__ = "project_class_topic_configs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    class_id = Column(Integer, ForeignKey("teaching_classes.id"), nullable=False, index=True)
+    topic_id = Column(Integer, ForeignKey("project_topics.id"), nullable=False, index=True)
+
+
+class ProjectTeam(Base):
+    __tablename__ = "project_teams"
+
+    id = Column(Integer, primary_key=True, index=True)
+    semester_id = Column(Integer, ForeignKey("semesters.id"), nullable=False, index=True)
+    class_id = Column(Integer, ForeignKey("teaching_classes.id"), nullable=False, index=True)
+    team_no = Column(String(50), nullable=False)
+    team_name = Column(String(100), nullable=False)
+    direction = Column(String(100), nullable=False)
+    leader_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    topic_id = Column(Integer, ForeignKey("project_topics.id"), nullable=True, index=True)
+    advisor_teacher_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    apply_note = Column(Text, nullable=True)
+    apply_attachment_path = Column(String, nullable=True)
+    status = Column(String(20), nullable=False, default="draft")
+    review_comment = Column(Text, nullable=True)
+    created_at = Column(TIMESTAMP(timezone=True), server_default=func.now(), nullable=False)
+
+
+class ProjectTeamMember(Base):
+    __tablename__ = "project_team_members"
+
+    id = Column(Integer, primary_key=True, index=True)
+    team_id = Column(Integer, ForeignKey("project_teams.id"), nullable=False, index=True)
+    student_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+
+
+
+
+

@@ -1,6 +1,8 @@
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Query
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Query, Form
+
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
+
 from sqlalchemy.orm import Session, aliased
 from pydantic import BaseModel
 import models
@@ -13,7 +15,8 @@ from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 
 from io import BytesIO
-from typing import Optional, Any
+from typing import Optional, Any, List
+
 from pathlib import Path
 import io
 import re
@@ -4466,4 +4469,968 @@ async def import_classes(file: UploadFile = File(...), db: Session = Depends(get
     if current:
         _sync_teacher_classes_from_students(db, current.id)
     return {"message": "导入完成", "created": created, "skipped": skipped}
+
+
+# ================= 综合项目组队申请体系 =================
+def _parse_date_only(text: Optional[str]):
+    value = (text or "").strip()
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+
+def _get_or_create_project_setting(db: Session, semester_id: int):
+    item = db.query(models.ProjectApplicationSetting).filter(
+        models.ProjectApplicationSetting.semester_id == semester_id
+    ).first()
+    if item:
+        return item
+
+    item = models.ProjectApplicationSetting(
+        semester_id=semester_id,
+        is_enabled=False,
+        min_team_size=2,
+        max_team_size=6,
+    )
+    db.add(item)
+    db.commit()
+    db.refresh(item)
+    return item
+
+
+def _is_project_apply_open(setting: models.ProjectApplicationSetting):
+    if not setting or not setting.is_enabled:
+        return False
+
+    today = datetime.now().date()
+    start = _parse_date_only(setting.open_start)
+    end = _parse_date_only(setting.open_end)
+    if start and today < start:
+        return False
+    if end and today > end:
+        return False
+    return True
+
+
+def _generate_project_team_no(db: Session, semester_id: int, class_id: int):
+    existed = db.query(models.ProjectTeam).filter(
+        models.ProjectTeam.semester_id == semester_id,
+        models.ProjectTeam.class_id == class_id
+    ).count()
+    return f"C{class_id:03d}-T{existed + 1:03d}"
+
+
+def _get_project_team_member_users(db: Session, team_id: int):
+    links = db.query(models.ProjectTeamMember).filter(models.ProjectTeamMember.team_id == team_id).all()
+    student_ids = [x.student_id for x in links]
+    users = db.query(models.User).filter(models.User.id.in_(student_ids)).all() if student_ids else []
+    user_map = {u.id: u for u in users}
+
+    rows = []
+    for sid in student_ids:
+        u = user_map.get(sid)
+        if not u:
+            continue
+        rows.append({
+            "id": u.id,
+            "username": u.username,
+            "real_name": u.real_name,
+            "student_no": u.student_no,
+            "class_name": u.class_name,
+        })
+    return rows
+
+
+def _project_team_to_dict(db: Session, team: models.ProjectTeam):
+    topic = db.query(models.ProjectTopic).filter(models.ProjectTopic.id == team.topic_id).first() if team.topic_id else None
+    teacher = db.query(models.User).filter(models.User.id == team.advisor_teacher_id).first() if team.advisor_teacher_id else None
+    cls = db.query(models.TeachingClass).filter(models.TeachingClass.id == team.class_id).first()
+    semester = db.query(models.Semester).filter(models.Semester.id == team.semester_id).first()
+
+    return {
+        "id": team.id,
+        "team_no": team.team_no,
+        "team_name": team.team_name,
+        "direction": team.direction,
+        "status": team.status,
+        "review_comment": team.review_comment,
+        "class_id": team.class_id,
+        "class_name": cls.name if cls else None,
+        "semester_id": team.semester_id,
+        "semester_name": semester.name if semester else None,
+        "leader_id": team.leader_id,
+        "topic_id": team.topic_id,
+        "topic_name": topic.title if topic else None,
+        "advisor_teacher_id": team.advisor_teacher_id,
+        "advisor_teacher_name": (teacher.real_name or teacher.username) if teacher else None,
+        "apply_note": team.apply_note,
+        "apply_attachment_path": team.apply_attachment_path,
+        "created_at": team.created_at.isoformat() if team.created_at else None,
+        "members": _get_project_team_member_users(db, team.id)
+    }
+
+
+def _ensure_student_single_team_in_semester(db: Session, student_id: int, semester_id: int, ignore_team_id: Optional[int] = None):
+    q = db.query(models.ProjectTeamMember, models.ProjectTeam).join(
+        models.ProjectTeam, models.ProjectTeamMember.team_id == models.ProjectTeam.id
+    ).filter(
+        models.ProjectTeamMember.student_id == student_id,
+        models.ProjectTeam.semester_id == semester_id
+    )
+    if ignore_team_id:
+        q = q.filter(models.ProjectTeam.id != ignore_team_id)
+    existed = q.first()
+    if existed:
+        raise HTTPException(status_code=400, detail="该学生在当前学期已加入其他队伍")
+
+
+@app.post("/project/upload")
+def upload_project_file(file: UploadFile = File(...)):
+    ext = Path(file.filename or "").suffix.lower()
+    allowed_ext = {".pdf", ".doc", ".docx", ".zip", ".rar", ".7z", ".txt", ".md", ".ppt", ".pptx"}
+    if ext and ext not in allowed_ext:
+        raise HTTPException(status_code=400, detail="不支持的附件类型")
+
+    safe_name = _safe_file_part(Path(file.filename or "file").stem, "project_file")
+    folder = Path(__file__).resolve().parent / "document" / "project_uploads"
+    folder.mkdir(parents=True, exist_ok=True)
+    final_path = folder / f"{int(time.time() * 1000)}_{safe_name}{ext or '.dat'}"
+    with final_path.open("wb") as f:
+        f.write(file.file.read())
+
+    return {"path": final_path.as_posix(), "filename": file.filename}
+
+
+@app.get("/file/preview")
+def preview_local_file(path: str = Query(...)):
+    file_path = Path(path)
+    if not file_path.exists() or not file_path.is_file():
+        raise HTTPException(status_code=404, detail="文件不存在")
+    return FileResponse(file_path)
+
+
+@app.get("/admin/project/topics")
+
+def admin_list_project_topics(
+    semester_id: Optional[int] = Query(default=None),
+    keyword: Optional[str] = Query(default=None),
+    direction: Optional[str] = Query(default=None),
+    teacher_id: Optional[int] = Query(default=None),
+    only_current: bool = Query(default=True),
+    db: Session = Depends(get_db)
+):
+    current = _get_current_semester(db)
+    sid = semester_id
+    if only_current and current:
+        sid = current.id
+
+    q = db.query(models.ProjectTopic)
+    if sid:
+        q = q.filter(models.ProjectTopic.semester_id == sid)
+    if teacher_id:
+        q = q.filter(models.ProjectTopic.teacher_id == teacher_id)
+    if keyword:
+        q = q.filter(models.ProjectTopic.title.ilike(f"%{keyword}%"))
+    if direction:
+        q = q.filter(models.ProjectTopic.direction.ilike(f"%{direction}%"))
+
+    rows = q.order_by(models.ProjectTopic.id.desc()).all()
+    teacher_ids = list({x.teacher_id for x in rows})
+    teachers = db.query(models.User).filter(models.User.id.in_(teacher_ids)).all() if teacher_ids else []
+    teacher_map = {t.id: (t.real_name or t.username) for t in teachers}
+
+    return [
+        {
+            "id": x.id,
+            "semester_id": x.semester_id,
+            "title": x.title,
+            "teacher_id": x.teacher_id,
+            "teacher_name": teacher_map.get(x.teacher_id),
+            "materials": x.materials,
+            "attachment_path": x.attachment_path,
+            "direction": x.direction,
+            "is_published": x.is_published,
+            "created_by": x.created_by,
+            "created_at": x.created_at.isoformat() if x.created_at else None,
+        }
+        for x in rows
+    ]
+
+
+@app.post("/admin/project/topics")
+def admin_create_project_topic(payload: schemas.ProjectTopicCreate, db: Session = Depends(get_db)):
+    current = _get_current_semester(db)
+    if not current:
+        raise HTTPException(status_code=400, detail="当前学期未发布")
+
+    teacher = _require_teacher_user(db, payload.teacher_id)
+
+    item = models.ProjectTopic(
+        semester_id=current.id,
+        title=payload.title.strip(),
+        teacher_id=teacher.id,
+        materials=(payload.materials or "").strip() or None,
+        attachment_path=(payload.attachment_path or "").strip() or None,
+        direction=payload.direction.strip(),
+        is_published=payload.is_published,
+        created_by="admin"
+    )
+    db.add(item)
+    db.commit()
+    db.refresh(item)
+    return {"message": "课题创建成功", "id": item.id}
+
+
+@app.put("/admin/project/topics/{topic_id}")
+def admin_update_project_topic(topic_id: int, payload: schemas.ProjectTopicUpdate, db: Session = Depends(get_db)):
+    item = db.query(models.ProjectTopic).filter(models.ProjectTopic.id == topic_id).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="课题不存在")
+
+    if payload.title is not None:
+        item.title = payload.title.strip()
+    if payload.teacher_id is not None:
+        teacher = _require_teacher_user(db, payload.teacher_id)
+        item.teacher_id = teacher.id
+    if payload.materials is not None:
+        item.materials = (payload.materials or "").strip() or None
+    if payload.attachment_path is not None:
+        item.attachment_path = (payload.attachment_path or "").strip() or None
+    if payload.direction is not None:
+        item.direction = payload.direction.strip()
+    if payload.is_published is not None:
+        item.is_published = payload.is_published
+
+    db.commit()
+    return {"message": "课题更新成功"}
+
+
+@app.delete("/admin/project/topics/{topic_id}")
+def admin_delete_project_topic(topic_id: int, db: Session = Depends(get_db)):
+    item = db.query(models.ProjectTopic).filter(models.ProjectTopic.id == topic_id).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="课题不存在")
+
+    used = db.query(models.ProjectTeam).filter(models.ProjectTeam.topic_id == topic_id).count()
+    if used > 0:
+        raise HTTPException(status_code=400, detail="该课题已被队伍申请，无法删除")
+
+    db.query(models.ProjectClassTopicConfig).filter(models.ProjectClassTopicConfig.topic_id == topic_id).delete(synchronize_session=False)
+    db.delete(item)
+    db.commit()
+    return {"message": "课题已删除"}
+
+
+@app.get("/admin/project/settings/current")
+def admin_get_project_setting(db: Session = Depends(get_db)):
+    current = _get_current_semester(db)
+    if not current:
+        raise HTTPException(status_code=400, detail="当前学期未发布")
+
+    item = _get_or_create_project_setting(db, current.id)
+    return {
+        "semester_id": item.semester_id,
+        "is_enabled": item.is_enabled,
+        "open_start": item.open_start,
+        "open_end": item.open_end,
+        "min_team_size": item.min_team_size,
+        "max_team_size": item.max_team_size,
+    }
+
+
+@app.put("/admin/project/settings/current")
+def admin_update_project_setting(payload: schemas.ProjectApplicationSettingUpdate, db: Session = Depends(get_db)):
+    current = _get_current_semester(db)
+    if not current:
+        raise HTTPException(status_code=400, detail="当前学期未发布")
+
+    if payload.min_team_size <= 0:
+        raise HTTPException(status_code=400, detail="队伍人数下限必须大于0")
+    if payload.max_team_size < payload.min_team_size:
+        raise HTTPException(status_code=400, detail="队伍人数上限不能小于下限")
+
+    item = _get_or_create_project_setting(db, current.id)
+    item.is_enabled = payload.is_enabled
+    item.open_start = (payload.open_start or "").strip() or None
+    item.open_end = (payload.open_end or "").strip() or None
+    item.min_team_size = payload.min_team_size
+    item.max_team_size = payload.max_team_size
+    db.commit()
+    return {"message": "综设申请设置已保存"}
+
+
+@app.get("/admin/project/class-topic-configs")
+def admin_get_class_topic_configs(
+    semester_id: Optional[int] = Query(default=None),
+    db: Session = Depends(get_db)
+):
+    current = _get_current_semester(db)
+    sid = semester_id or (current.id if current else None)
+    if sid is None:
+        return []
+
+    classes = db.query(models.TeachingClass).filter(models.TeachingClass.semester_id == sid).order_by(models.TeachingClass.id.asc()).all()
+    class_ids = [x.id for x in classes]
+    cfg_rows = db.query(models.ProjectClassTopicConfig).filter(models.ProjectClassTopicConfig.class_id.in_(class_ids)).all() if class_ids else []
+    topic_ids = [x.topic_id for x in cfg_rows]
+    topics = db.query(models.ProjectTopic).filter(models.ProjectTopic.id.in_(topic_ids)).all() if topic_ids else []
+
+    topic_map = {t.id: t for t in topics}
+    class_cfg_map = {}
+    for c in cfg_rows:
+        class_cfg_map.setdefault(c.class_id, []).append(c.topic_id)
+
+    return [
+        {
+            "class_id": cls.id,
+            "class_name": cls.name,
+            "topic_ids": class_cfg_map.get(cls.id, []),
+            "topics": [
+                {
+                    "id": tid,
+                    "title": topic_map[tid].title,
+                    "direction": topic_map[tid].direction,
+                    "teacher_id": topic_map[tid].teacher_id,
+                    "is_published": topic_map[tid].is_published,
+                }
+                for tid in class_cfg_map.get(cls.id, []) if tid in topic_map
+            ]
+        }
+        for cls in classes
+    ]
+
+
+@app.put("/admin/project/classes/{class_id}/topics")
+def admin_set_class_topics(class_id: int, payload: schemas.ProjectClassTopicAssign, db: Session = Depends(get_db)):
+    cls = db.query(models.TeachingClass).filter(models.TeachingClass.id == class_id).first()
+    if not cls:
+        raise HTTPException(status_code=404, detail="班级不存在")
+
+    topic_ids = list(set(payload.topic_ids or []))
+    if topic_ids:
+        valid_count = db.query(models.ProjectTopic).filter(models.ProjectTopic.id.in_(topic_ids)).count()
+        if valid_count != len(topic_ids):
+            raise HTTPException(status_code=400, detail="包含无效课题")
+
+    db.query(models.ProjectClassTopicConfig).filter(models.ProjectClassTopicConfig.class_id == class_id).delete(synchronize_session=False)
+    for tid in topic_ids:
+        db.add(models.ProjectClassTopicConfig(class_id=class_id, topic_id=tid))
+
+    db.commit()
+    return {"message": "班级课题配置已更新", "topic_count": len(topic_ids)}
+
+
+@app.get("/admin/project/teams")
+def admin_list_project_teams(
+    semester_id: Optional[int] = Query(default=None),
+    direction: Optional[str] = Query(default=None),
+    topic_keyword: Optional[str] = Query(default=None),
+    teacher_keyword: Optional[str] = Query(default=None),
+    team_keyword: Optional[str] = Query(default=None),
+    db: Session = Depends(get_db)
+):
+    q = db.query(models.ProjectTeam)
+    if semester_id:
+        q = q.filter(models.ProjectTeam.semester_id == semester_id)
+    if direction:
+        q = q.filter(models.ProjectTeam.direction.ilike(f"%{direction}%"))
+    if team_keyword:
+        q = q.filter(
+            (models.ProjectTeam.team_no.ilike(f"%{team_keyword}%")) |
+            (models.ProjectTeam.team_name.ilike(f"%{team_keyword}%"))
+        )
+
+    teams = q.order_by(models.ProjectTeam.id.desc()).all()
+    rows = [_project_team_to_dict(db, t) for t in teams]
+
+    if topic_keyword:
+        rows = [x for x in rows if x.get("topic_name") and topic_keyword.lower() in x["topic_name"].lower()]
+    if teacher_keyword:
+        rows = [x for x in rows if x.get("advisor_teacher_name") and teacher_keyword.lower() in x["advisor_teacher_name"].lower()]
+
+    return rows
+
+
+@app.post("/admin/project/teams")
+def admin_create_project_team(payload: schemas.ProjectTeamAdminCreate, db: Session = Depends(get_db)):
+    cls = db.query(models.TeachingClass).filter(models.TeachingClass.id == payload.class_id).first()
+    if not cls:
+        raise HTTPException(status_code=404, detail="班级不存在")
+
+    leader = db.query(models.User).filter(models.User.id == payload.leader_id, models.User.role == "student").first()
+    if not leader:
+        raise HTTPException(status_code=404, detail="队长不存在")
+
+    _ensure_student_single_team_in_semester(db, leader.id, cls.semester_id)
+
+    team = models.ProjectTeam(
+        semester_id=cls.semester_id,
+        class_id=cls.id,
+        team_no=_generate_project_team_no(db, cls.semester_id, cls.id),
+        team_name=payload.team_name.strip(),
+        direction=payload.direction.strip(),
+        leader_id=leader.id,
+        status="draft",
+    )
+    db.add(team)
+    db.flush()
+
+    member_ids = list(dict.fromkeys([leader.id] + [x for x in (payload.member_ids or []) if x != leader.id]))
+    for sid in member_ids:
+        stu = db.query(models.User).filter(models.User.id == sid, models.User.role == "student").first()
+        if not stu:
+            continue
+        _ensure_student_single_team_in_semester(db, sid, cls.semester_id, ignore_team_id=team.id)
+        db.add(models.ProjectTeamMember(team_id=team.id, student_id=sid))
+
+    db.commit()
+    return {"message": "队伍创建成功", "team_id": team.id}
+
+
+@app.put("/admin/project/teams/{team_id}")
+def admin_update_project_team(team_id: int, payload: schemas.ProjectTeamUpdate, db: Session = Depends(get_db)):
+    team = db.query(models.ProjectTeam).filter(models.ProjectTeam.id == team_id).first()
+    if not team:
+        raise HTTPException(status_code=404, detail="队伍不存在")
+
+    if payload.team_name is not None:
+        team.team_name = payload.team_name.strip()
+    if payload.direction is not None:
+        team.direction = payload.direction.strip()
+
+    if payload.member_ids is not None:
+        member_ids = list(dict.fromkeys(payload.member_ids))
+        if team.leader_id not in member_ids:
+            member_ids = [team.leader_id] + member_ids
+
+        db.query(models.ProjectTeamMember).filter(models.ProjectTeamMember.team_id == team_id).delete(synchronize_session=False)
+        for sid in member_ids:
+            stu = db.query(models.User).filter(models.User.id == sid, models.User.role == "student").first()
+            if not stu:
+                continue
+            _ensure_student_single_team_in_semester(db, sid, team.semester_id, ignore_team_id=team.id)
+            db.add(models.ProjectTeamMember(team_id=team.id, student_id=sid))
+
+    db.commit()
+    return {"message": "队伍信息已更新"}
+
+
+@app.delete("/admin/project/teams/{team_id}")
+def admin_delete_project_team(team_id: int, db: Session = Depends(get_db)):
+    team = db.query(models.ProjectTeam).filter(models.ProjectTeam.id == team_id).first()
+    if not team:
+        raise HTTPException(status_code=404, detail="队伍不存在")
+
+    db.query(models.ProjectTeamMember).filter(models.ProjectTeamMember.team_id == team_id).delete(synchronize_session=False)
+    db.delete(team)
+    db.commit()
+    return {"message": "队伍已删除"}
+
+
+@app.get("/teachers/{teacher_id}/project/topics")
+def teacher_list_project_topics(
+    teacher_id: int,
+    semester_id: Optional[int] = Query(default=None),
+    db: Session = Depends(get_db)
+):
+    teacher_id = _require_teacher_user(db, teacher_id).id
+    current = _get_current_semester(db)
+    sid = semester_id or (current.id if current else None)
+
+    q = db.query(models.ProjectTopic).filter(models.ProjectTopic.teacher_id == teacher_id)
+    if sid:
+        q = q.filter(models.ProjectTopic.semester_id == sid)
+
+    rows = q.order_by(models.ProjectTopic.id.desc()).all()
+    return [
+        {
+            "id": x.id,
+            "semester_id": x.semester_id,
+            "title": x.title,
+            "teacher_id": x.teacher_id,
+            "materials": x.materials,
+            "attachment_path": x.attachment_path,
+            "direction": x.direction,
+            "is_published": x.is_published,
+            "created_by": x.created_by,
+            "created_at": x.created_at.isoformat() if x.created_at else None,
+        }
+        for x in rows
+    ]
+
+
+@app.post("/teachers/{teacher_id}/project/topics")
+def teacher_create_project_topic(teacher_id: int, payload: schemas.ProjectTopicCreate, db: Session = Depends(get_db)):
+    teacher_id = _require_teacher_user(db, teacher_id).id
+    current = _get_current_semester(db)
+    if not current:
+        raise HTTPException(status_code=400, detail="当前学期未发布")
+
+    item = models.ProjectTopic(
+        semester_id=current.id,
+        title=payload.title.strip(),
+        teacher_id=teacher_id,
+        materials=(payload.materials or "").strip() or None,
+        attachment_path=(payload.attachment_path or "").strip() or None,
+        direction=payload.direction.strip(),
+        is_published=payload.is_published,
+        created_by="teacher"
+    )
+    db.add(item)
+    db.commit()
+    db.refresh(item)
+    return {"message": "题目创建成功", "id": item.id}
+
+
+@app.put("/teachers/{teacher_id}/project/topics/{topic_id}")
+def teacher_update_project_topic(teacher_id: int, topic_id: int, payload: schemas.ProjectTopicUpdate, db: Session = Depends(get_db)):
+    teacher_id = _require_teacher_user(db, teacher_id).id
+    item = db.query(models.ProjectTopic).filter(models.ProjectTopic.id == topic_id).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="课题不存在")
+    if item.teacher_id != teacher_id:
+        raise HTTPException(status_code=403, detail="无权修改该课题")
+
+    if payload.title is not None:
+        item.title = payload.title.strip()
+    if payload.materials is not None:
+        item.materials = (payload.materials or "").strip() or None
+    if payload.attachment_path is not None:
+        item.attachment_path = (payload.attachment_path or "").strip() or None
+    if payload.direction is not None:
+        item.direction = payload.direction.strip()
+    if payload.is_published is not None:
+        item.is_published = payload.is_published
+
+    db.commit()
+    return {"message": "题目更新成功"}
+
+
+@app.delete("/teachers/{teacher_id}/project/topics/{topic_id}")
+def teacher_delete_project_topic(teacher_id: int, topic_id: int, db: Session = Depends(get_db)):
+    teacher_id = _require_teacher_user(db, teacher_id).id
+    item = db.query(models.ProjectTopic).filter(models.ProjectTopic.id == topic_id).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="课题不存在")
+    if item.teacher_id != teacher_id:
+        raise HTTPException(status_code=403, detail="无权删除该课题")
+
+    used = db.query(models.ProjectTeam).filter(models.ProjectTeam.topic_id == topic_id).count()
+    if used > 0:
+        raise HTTPException(status_code=400, detail="该课题已有申请，无法删除")
+
+    db.query(models.ProjectClassTopicConfig).filter(models.ProjectClassTopicConfig.topic_id == topic_id).delete(synchronize_session=False)
+    db.delete(item)
+    db.commit()
+    return {"message": "题目已删除"}
+
+
+@app.get("/teachers/{teacher_id}/project/applications")
+def teacher_list_project_applications(
+    teacher_id: int,
+    status: Optional[str] = Query(default=None),
+    db: Session = Depends(get_db)
+):
+    teacher_id = _require_teacher_user(db, teacher_id).id
+    current = _get_current_semester(db)
+    if not current:
+        return []
+
+    q = db.query(models.ProjectTeam).filter(
+        models.ProjectTeam.semester_id == current.id,
+        models.ProjectTeam.advisor_teacher_id == teacher_id,
+        models.ProjectTeam.topic_id.isnot(None)
+    )
+    if status:
+        q = q.filter(models.ProjectTeam.status == status)
+
+    teams = q.order_by(models.ProjectTeam.id.desc()).all()
+    return [_project_team_to_dict(db, t) for t in teams]
+
+
+@app.post("/teachers/{teacher_id}/project/applications/{team_id}/accept")
+def teacher_accept_project_application(
+    teacher_id: int,
+    team_id: int,
+    payload: schemas.ProjectTeamReviewPayload,
+    db: Session = Depends(get_db)
+):
+    teacher_id = _require_teacher_user(db, teacher_id).id
+    team = db.query(models.ProjectTeam).filter(models.ProjectTeam.id == team_id).first()
+    if not team:
+        raise HTTPException(status_code=404, detail="申请队伍不存在")
+    if team.advisor_teacher_id != teacher_id:
+        raise HTTPException(status_code=403, detail="无权处理该申请")
+
+    team.status = "accepted"
+    team.review_comment = (payload.comment or "").strip() or None
+    db.commit()
+    return {"message": "已接受组队申请"}
+
+
+@app.post("/teachers/{teacher_id}/project/applications/{team_id}/reject")
+def teacher_reject_project_application(
+    teacher_id: int,
+    team_id: int,
+    payload: schemas.ProjectTeamReviewPayload,
+    db: Session = Depends(get_db)
+):
+    teacher_id = _require_teacher_user(db, teacher_id).id
+    team = db.query(models.ProjectTeam).filter(models.ProjectTeam.id == team_id).first()
+    if not team:
+        raise HTTPException(status_code=404, detail="申请队伍不存在")
+    if team.advisor_teacher_id != teacher_id:
+        raise HTTPException(status_code=403, detail="无权处理该申请")
+
+    team.status = "rejected"
+    team.review_comment = (payload.comment or "").strip() or None
+    db.commit()
+    return {"message": "已拒绝组队申请"}
+
+
+@app.get("/students/{student_id}/project/entry")
+def student_project_entry_info(student_id: int, db: Session = Depends(get_db)):
+    student = db.query(models.User).filter(models.User.id == student_id, models.User.role == "student").first()
+    if not student:
+        raise HTTPException(status_code=404, detail="学生不存在")
+
+    current = _get_current_semester(db)
+    if not current:
+        return {"setting": None, "classes": []}
+
+    setting = _get_or_create_project_setting(db, current.id)
+    links = db.query(models.ClassStudent).filter(models.ClassStudent.student_id == student_id).all()
+    classes = db.query(models.TeachingClass).filter(
+        models.TeachingClass.id.in_([x.class_id for x in links]) if links else False,
+        models.TeachingClass.semester_id == current.id
+    ).all() if links else []
+
+    return {
+        "setting": {
+            "is_enabled": setting.is_enabled,
+            "open_start": setting.open_start,
+            "open_end": setting.open_end,
+            "min_team_size": setting.min_team_size,
+            "max_team_size": setting.max_team_size,
+            "is_window_open": _is_project_apply_open(setting),
+        },
+        "classes": [
+            {
+                "id": c.id,
+                "name": c.name,
+                "teacher_id": c.teacher_id,
+            }
+            for c in classes
+        ]
+    }
+
+
+@app.get("/students/{student_id}/project/students/search")
+def student_search_project_students(
+    student_id: int,
+    class_id: int = Query(...),
+    keyword: str = Query(...),
+    db: Session = Depends(get_db)
+):
+    _ = db.query(models.User).filter(models.User.id == student_id, models.User.role == "student").first()
+    if not _:
+        raise HTTPException(status_code=404, detail="学生不存在")
+
+    links = db.query(models.ClassStudent).filter(models.ClassStudent.class_id == class_id).all()
+    student_ids = [x.student_id for x in links]
+    if not student_ids:
+        return []
+
+    key = keyword.strip()
+    if not key:
+        return []
+
+    rows = db.query(models.User).filter(
+        models.User.id.in_(student_ids),
+        models.User.role == "student",
+        (
+            models.User.student_no.ilike(f"%{key}%") |
+            models.User.real_name.ilike(f"%{key}%") |
+            models.User.username.ilike(f"%{key}%")
+        )
+    ).order_by(models.User.id.asc()).all()
+
+    return [
+        {
+            "id": s.id,
+            "username": s.username,
+            "real_name": s.real_name,
+            "student_no": s.student_no,
+            "class_name": s.class_name,
+        }
+        for s in rows
+    ]
+
+
+@app.get("/students/{student_id}/project/teams")
+def student_list_project_teams(student_id: int, db: Session = Depends(get_db)):
+    student = db.query(models.User).filter(models.User.id == student_id, models.User.role == "student").first()
+    if not student:
+        raise HTTPException(status_code=404, detail="学生不存在")
+
+    current = _get_current_semester(db)
+    if not current:
+        return []
+
+    my_team_links = db.query(models.ProjectTeamMember).filter(models.ProjectTeamMember.student_id == student_id).all()
+    team_ids = [x.team_id for x in my_team_links]
+    teams = db.query(models.ProjectTeam).filter(
+        models.ProjectTeam.id.in_(team_ids) if team_ids else False,
+        models.ProjectTeam.semester_id == current.id
+    ).order_by(models.ProjectTeam.id.desc()).all() if team_ids else []
+
+    return [_project_team_to_dict(db, t) for t in teams]
+
+
+@app.post("/students/{student_id}/project/teams")
+def student_create_project_team(student_id: int, payload: schemas.ProjectTeamCreate, db: Session = Depends(get_db)):
+    student = db.query(models.User).filter(models.User.id == student_id, models.User.role == "student").first()
+    if not student:
+        raise HTTPException(status_code=404, detail="学生不存在")
+
+    current = _get_current_semester(db)
+    if not current:
+        raise HTTPException(status_code=400, detail="当前学期未发布")
+
+    setting = _get_or_create_project_setting(db, current.id)
+    if not _is_project_apply_open(setting):
+        raise HTTPException(status_code=400, detail="当前不在综设组队开放时间")
+
+    cls = db.query(models.TeachingClass).filter(
+        models.TeachingClass.id == payload.class_id,
+        models.TeachingClass.semester_id == current.id
+    ).first()
+    if not cls:
+        raise HTTPException(status_code=404, detail="班级不存在或不在当前学期")
+
+    link = db.query(models.ClassStudent).filter(
+        models.ClassStudent.class_id == cls.id,
+        models.ClassStudent.student_id == student_id
+    ).first()
+    if not link:
+        raise HTTPException(status_code=403, detail="你不在该班级，不能创建队伍")
+
+    _ensure_student_single_team_in_semester(db, student_id, current.id)
+
+    direction = payload.direction.strip()
+    if student.class_name and direction != student.class_name:
+        raise HTTPException(status_code=400, detail="队伍方向需与队长专业方向一致")
+
+    team = models.ProjectTeam(
+        semester_id=current.id,
+        class_id=cls.id,
+        team_no=_generate_project_team_no(db, current.id, cls.id),
+        team_name=payload.team_name.strip(),
+        direction=direction,
+        leader_id=student_id,
+        status="draft"
+    )
+    db.add(team)
+    db.flush()
+    db.add(models.ProjectTeamMember(team_id=team.id, student_id=student_id))
+    db.commit()
+    db.refresh(team)
+    return {"message": "队伍创建成功", "team_id": team.id}
+
+
+@app.post("/students/{student_id}/project/teams/{team_id}/members")
+def student_add_project_team_member(
+    student_id: int,
+    team_id: int,
+    payload: schemas.ProjectTeamMemberAdd,
+    db: Session = Depends(get_db)
+):
+    student = db.query(models.User).filter(models.User.id == student_id, models.User.role == "student").first()
+    if not student:
+        raise HTTPException(status_code=404, detail="学生不存在")
+
+    team = db.query(models.ProjectTeam).filter(models.ProjectTeam.id == team_id).first()
+    if not team:
+        raise HTTPException(status_code=404, detail="队伍不存在")
+    if team.leader_id != student_id:
+        raise HTTPException(status_code=403, detail="仅队长可添加成员")
+
+    current = _get_current_semester(db)
+    if not current or team.semester_id != current.id:
+        raise HTTPException(status_code=400, detail="仅支持当前学期队伍操作")
+
+    setting = _get_or_create_project_setting(db, current.id)
+    if not _is_project_apply_open(setting):
+        raise HTTPException(status_code=400, detail="当前不在综设组队开放时间")
+
+    member_user = db.query(models.User).filter(models.User.id == payload.student_id, models.User.role == "student").first()
+    if not member_user:
+        raise HTTPException(status_code=404, detail="待添加学生不存在")
+
+    class_link = db.query(models.ClassStudent).filter(
+        models.ClassStudent.class_id == team.class_id,
+        models.ClassStudent.student_id == payload.student_id
+    ).first()
+    if not class_link:
+        raise HTTPException(status_code=400, detail="该学生不在同一班级")
+
+    if (member_user.class_name or "") != team.direction:
+        raise HTTPException(status_code=400, detail="该学生专业方向与队伍方向不一致")
+
+    _ensure_student_single_team_in_semester(db, payload.student_id, team.semester_id)
+
+    existed = db.query(models.ProjectTeamMember).filter(
+        models.ProjectTeamMember.team_id == team_id,
+        models.ProjectTeamMember.student_id == payload.student_id
+    ).first()
+    if existed:
+        return {"message": "该成员已在队伍中"}
+
+    current_count = db.query(models.ProjectTeamMember).filter(models.ProjectTeamMember.team_id == team_id).count()
+    if current_count >= setting.max_team_size:
+        raise HTTPException(status_code=400, detail=f"队伍人数不能超过{setting.max_team_size}人")
+
+    db.add(models.ProjectTeamMember(team_id=team_id, student_id=payload.student_id))
+    db.commit()
+    return {"message": "成员添加成功"}
+
+
+@app.delete("/students/{student_id}/project/teams/{team_id}/members/{member_id}")
+def student_remove_project_team_member(
+    student_id: int,
+    team_id: int,
+    member_id: int,
+    db: Session = Depends(get_db)
+):
+    team = db.query(models.ProjectTeam).filter(models.ProjectTeam.id == team_id).first()
+    if not team:
+        raise HTTPException(status_code=404, detail="队伍不存在")
+    if team.leader_id != student_id:
+        raise HTTPException(status_code=403, detail="仅队长可移除成员")
+    if member_id == student_id:
+        raise HTTPException(status_code=400, detail="队长不能移除自己")
+
+    link = db.query(models.ProjectTeamMember).filter(
+        models.ProjectTeamMember.team_id == team_id,
+        models.ProjectTeamMember.student_id == member_id
+    ).first()
+    if not link:
+        raise HTTPException(status_code=404, detail="成员不存在")
+
+    db.delete(link)
+    db.commit()
+    return {"message": "成员已移除"}
+
+
+@app.get("/students/{student_id}/project/topics/available")
+def student_list_available_topics(
+    student_id: int,
+    team_id: int = Query(...),
+    db: Session = Depends(get_db)
+):
+    student = db.query(models.User).filter(models.User.id == student_id, models.User.role == "student").first()
+    if not student:
+        raise HTTPException(status_code=404, detail="学生不存在")
+
+    team = db.query(models.ProjectTeam).filter(models.ProjectTeam.id == team_id).first()
+    if not team:
+        raise HTTPException(status_code=404, detail="队伍不存在")
+
+    me_in_team = db.query(models.ProjectTeamMember).filter(
+        models.ProjectTeamMember.team_id == team_id,
+        models.ProjectTeamMember.student_id == student_id
+    ).first()
+    if not me_in_team:
+        raise HTTPException(status_code=403, detail="你不在该队伍中")
+
+    cfg_rows = db.query(models.ProjectClassTopicConfig).filter(
+        models.ProjectClassTopicConfig.class_id == team.class_id
+    ).all()
+    topic_ids = [x.topic_id for x in cfg_rows]
+    if not topic_ids:
+        return []
+
+    topics = db.query(models.ProjectTopic).filter(
+        models.ProjectTopic.id.in_(topic_ids),
+        models.ProjectTopic.is_published == True,
+        models.ProjectTopic.direction == team.direction
+    ).order_by(models.ProjectTopic.id.desc()).all()
+
+    teacher_ids = list({x.teacher_id for x in topics})
+    teachers = db.query(models.User).filter(models.User.id.in_(teacher_ids)).all() if teacher_ids else []
+    teacher_map = {t.id: (t.real_name or t.username) for t in teachers}
+
+    return [
+        {
+            "id": x.id,
+            "title": x.title,
+            "teacher_id": x.teacher_id,
+            "teacher_name": teacher_map.get(x.teacher_id),
+            "materials": x.materials,
+            "attachment_path": x.attachment_path,
+            "direction": x.direction,
+            "is_published": x.is_published,
+        }
+        for x in topics
+    ]
+
+
+@app.post("/students/{student_id}/project/teams/{team_id}/apply-topic")
+def student_apply_project_topic(
+    student_id: int,
+    team_id: int,
+    topic_id: int = Form(...),
+    note: str = Form(default=""),
+    attachment_path: str = Form(default=""),
+    db: Session = Depends(get_db)
+):
+    student = db.query(models.User).filter(models.User.id == student_id, models.User.role == "student").first()
+    if not student:
+        raise HTTPException(status_code=404, detail="学生不存在")
+
+    team = db.query(models.ProjectTeam).filter(models.ProjectTeam.id == team_id).first()
+    if not team:
+        raise HTTPException(status_code=404, detail="队伍不存在")
+    if team.leader_id != student_id:
+        raise HTTPException(status_code=403, detail="仅队长可提交课题申请")
+
+    current = _get_current_semester(db)
+    if not current or team.semester_id != current.id:
+        raise HTTPException(status_code=400, detail="仅支持当前学期申请")
+
+    setting = _get_or_create_project_setting(db, current.id)
+    if not _is_project_apply_open(setting):
+        raise HTTPException(status_code=400, detail="当前不在综设组队开放时间")
+
+    members_count = db.query(models.ProjectTeamMember).filter(models.ProjectTeamMember.team_id == team_id).count()
+    if members_count < setting.min_team_size or members_count > setting.max_team_size:
+        raise HTTPException(status_code=400, detail=f"队伍人数需在{setting.min_team_size}-{setting.max_team_size}人之间")
+
+    topic = db.query(models.ProjectTopic).filter(models.ProjectTopic.id == topic_id).first()
+    if not topic or not topic.is_published:
+        raise HTTPException(status_code=400, detail="课题不存在或未发布")
+
+    cfg = db.query(models.ProjectClassTopicConfig).filter(
+        models.ProjectClassTopicConfig.class_id == team.class_id,
+        models.ProjectClassTopicConfig.topic_id == topic.id
+    ).first()
+    if not cfg:
+        raise HTTPException(status_code=400, detail="该班级未配置此课题")
+
+    if topic.direction != team.direction:
+        raise HTTPException(status_code=400, detail="队伍方向与课题方向不一致")
+
+    team.topic_id = topic.id
+    team.advisor_teacher_id = topic.teacher_id
+    team.apply_note = note.strip() or None
+    team.apply_attachment_path = attachment_path.strip() or None
+    team.status = "pending"
+    team.review_comment = None
+    db.commit()
+
+    return {"message": "课题申请已提交，等待老师审核"}
+
 

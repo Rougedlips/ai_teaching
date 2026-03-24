@@ -14,6 +14,9 @@ import StudentManagement from '../views/StudentManagement.vue'
 import AssignmentManagement from '../views/AssignmentManagement.vue'
 import ReportManagement from '../views/ReportManagement.vue'
 import AdminCenter from '../views/AdminCenter.vue'
+import TeacherProjectSelection from '../views/TeacherProjectSelection.vue'
+import AdminProjectManagement from '../views/AdminProjectManagement.vue'
+
 
 
 const routes: Array<RouteRecordRaw> = [
@@ -77,11 +80,23 @@ const routes: Array<RouteRecordRaw> = [
     component: ReportManagement,
     meta: { requiresAuth: true, role: 'teacher' }
   },
+  {
+    path: '/project-selection',
+    name: 'TeacherProjectSelection',
+    component: TeacherProjectSelection,
+    meta: { requiresAuth: true, role: 'teacher' }
+  },
 
   {
     path: '/admin-center',
     name: 'AdminCenter',
     component: AdminCenter,
+    meta: { requiresAuth: true, role: 'admin' }
+  },
+  {
+    path: '/admin-project-management',
+    name: 'AdminProjectManagement',
+    component: AdminProjectManagement,
     meta: { requiresAuth: true, role: 'admin' }
   }
 ]

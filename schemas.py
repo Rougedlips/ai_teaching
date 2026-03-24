@@ -184,3 +184,70 @@ class StudentUpdate(BaseModel):
 
 class PasswordReset(BaseModel):
     new_password: str
+
+
+# ================= 综合项目组队申请体系 =================
+class ProjectTopicCreate(BaseModel):
+    title: str
+    teacher_id: int
+    materials: Optional[str] = None
+    attachment_path: Optional[str] = None
+    direction: str
+    is_published: bool = False
+
+
+
+class ProjectTopicUpdate(BaseModel):
+    title: Optional[str] = None
+    teacher_id: Optional[int] = None
+    materials: Optional[str] = None
+    attachment_path: Optional[str] = None
+    direction: Optional[str] = None
+    is_published: Optional[bool] = None
+
+
+
+class ProjectApplicationSettingUpdate(BaseModel):
+    is_enabled: bool
+    open_start: Optional[str] = None
+    open_end: Optional[str] = None
+    min_team_size: int = 2
+    max_team_size: int = 6
+
+
+class ProjectClassTopicAssign(BaseModel):
+    topic_ids: List[int]
+
+
+class ProjectTeamCreate(BaseModel):
+    class_id: int
+    team_name: str
+    direction: str
+
+
+class ProjectTeamAdminCreate(BaseModel):
+    class_id: int
+    team_name: str
+    direction: str
+    leader_id: int
+    member_ids: List[int] = []
+
+
+class ProjectTeamUpdate(BaseModel):
+    team_name: Optional[str] = None
+    direction: Optional[str] = None
+    member_ids: Optional[List[int]] = None
+
+
+class ProjectTeamMemberAdd(BaseModel):
+    student_id: int
+
+
+class ProjectTopicApplyPayload(BaseModel):
+    topic_id: int
+    note: Optional[str] = None
+
+
+class ProjectTeamReviewPayload(BaseModel):
+    comment: Optional[str] = None
+
