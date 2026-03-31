@@ -74,6 +74,7 @@
                 <el-option v-for="c in currentClasses" :key="c.id" :label="c.name" :value="c.name" />
               </el-select>
             </el-form-item>
+            <el-form-item label="专业方向"><el-input v-model="studentFilters.major_direction" clearable placeholder="如：人工智能" /></el-form-item>
             <el-form-item label="账号"><el-input v-model="studentFilters.username" clearable /></el-form-item>
             <el-form-item label="学号"><el-input v-model="studentFilters.student_no" clearable /></el-form-item>
             <el-form-item label="姓名"><el-input v-model="studentFilters.real_name" clearable /></el-form-item>
@@ -101,6 +102,7 @@
             <el-table-column prop="grade" label="年级" width="90" />
             <el-table-column prop="semester" label="学期" min-width="130" />
             <el-table-column prop="class_name" label="班级" width="140" />
+            <el-table-column prop="major_direction" label="专业方向" min-width="180" />
             <el-table-column prop="teacher_name" label="归属老师" width="130" />
             <el-table-column prop="username" label="账号" min-width="130" />
             <el-table-column prop="student_no" label="学号" min-width="130" />
@@ -212,6 +214,7 @@
         <el-form-item label="姓名"><el-input v-model="studentForm.real_name" /></el-form-item>
         <el-form-item label="年级"><el-input v-model="studentForm.grade" /></el-form-item>
         <el-form-item label="班级"><el-input v-model="studentForm.class_name" /></el-form-item>
+        <el-form-item label="专业方向"><el-input v-model="studentForm.major_direction" placeholder="默认：人工智能+复合型创新" /></el-form-item>
         <el-form-item label="归属老师">
           <el-select v-model="studentForm.teacher_id" placeholder="请选择老师" clearable style="width: 100%">
             <el-option v-for="t in teachers" :key="t.id" :label="teacherDisplayName(t)" :value="t.id" />
@@ -302,6 +305,7 @@ interface StudentItem {
   real_name: string | null
   grade: string | null
   class_name: string | null
+  major_direction: string | null
   teacher_id: number | null
   teacher_name: string | null
 }
@@ -351,11 +355,12 @@ const studentForm = reactive({
   real_name: '',
   grade: '',
   class_name: '',
+  major_direction: '人工智能+复合型创新',
   teacher_id: undefined as number | undefined,
   password: '',
 })
 
-const studentFilters = reactive({ grade: '', class_name: '', username: '', student_no: '', real_name: '', teacher_name: '' })
+const studentFilters = reactive({ grade: '', class_name: '', major_direction: '', username: '', student_no: '', real_name: '', teacher_name: '' })
 const classFilters = reactive({ semester_id: undefined as number | undefined, class_name: '', teacher_name: '' })
 const classForm = reactive({ id: 0, semester_id: 0, name: '', teacher_id: 0 })
 const classStudentsDialogId = ref(0)
@@ -510,6 +515,7 @@ const openStudentDialog = (row?: StudentItem) => {
     studentForm.real_name = row.real_name || ''
     studentForm.grade = row.grade || ''
     studentForm.class_name = row.class_name || ''
+    studentForm.major_direction = row.major_direction || '人工智能+复合型创新'
     studentForm.teacher_id = row.teacher_id || undefined
     studentForm.password = ''
   } else {
@@ -519,6 +525,7 @@ const openStudentDialog = (row?: StudentItem) => {
     studentForm.real_name = ''
     studentForm.grade = ''
     studentForm.class_name = ''
+    studentForm.major_direction = '人工智能+复合型创新'
     studentForm.teacher_id = undefined
     studentForm.password = ''
   }
@@ -538,6 +545,7 @@ const saveStudent = async () => {
     real_name: studentForm.real_name.trim() || null,
     grade: studentForm.grade.trim() || null,
     class_name: studentForm.class_name.trim() || null,
+    major_direction: studentForm.major_direction.trim() || '人工智能+复合型创新',
     teacher_id: studentForm.teacher_id || null,
     password: password || undefined,
   }
@@ -580,6 +588,7 @@ const resetPassword = async (id: number) => {
 const resetStudentFilter = () => {
   studentFilters.grade = ''
   studentFilters.class_name = ''
+  studentFilters.major_direction = ''
   studentFilters.username = ''
   studentFilters.student_no = ''
   studentFilters.real_name = ''

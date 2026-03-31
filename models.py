@@ -16,7 +16,9 @@ class User(Base):
     student_no = Column(String(50), unique=True, nullable=True)
     grade = Column(String(20), nullable=True)
     class_name = Column(String(50), nullable=True)
+    major_direction = Column(String(100), nullable=True)
     teacher_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+
 
     bio = Column(String, nullable=True)     # 个人简介
     skills = Column(String, nullable=True)  # 擅长技术
@@ -193,7 +195,21 @@ class ClassTeamMember(Base):
     student_id = Column(Integer, ForeignKey("users.id"), nullable=False)
 
 
+class ClassLearningSurvey(Base):
+    __tablename__ = "class_learning_surveys"
+
+    id = Column(Integer, primary_key=True, index=True)
+    class_id = Column(Integer, ForeignKey("teaching_classes.id"), nullable=False, index=True)
+    student_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    analysis_score = Column(Integer, nullable=True)
+    open_mind_score = Column(Integer, nullable=True)
+    thinking_confidence_score = Column(Integer, nullable=True)
+    teacher_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    updated_at = Column(TIMESTAMP(timezone=True), server_default=func.now(), nullable=False)
+
+
 # ================= 综合项目组队申请体系 =================
+
 class ProjectTopic(Base):
     __tablename__ = "project_topics"
 

@@ -11,14 +11,17 @@ from database import engine, get_db, SessionLocal
 import jwt
 from passlib.context import CryptContext
 from datetime import datetime, timedelta, timezone
-from sqlalchemy import func
+from sqlalchemy import func, text, inspect
+
 from sqlalchemy.exc import IntegrityError
 
 from io import BytesIO
 from typing import Optional, Any, List
 
 from pathlib import Path
+from collections import Counter
 import io
+
 import re
 import tokenize
 
@@ -27,6 +30,7 @@ import shutil
 import tempfile
 import zipfile
 import tarfile
+import base64
 import importlib
 import time
 from http.client import IncompleteRead
@@ -49,8 +53,34 @@ pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 
 SECRET_KEY = "my_super_secret_graduation_key"
 ALGORITHM = "HS256"
+STUDENT_DEFAULT_MAJOR_DIRECTION = "人工智能+复合型创新"
+
+
+def _normalize_student_major_direction(value: Optional[str]) -> str:
+    text_value = (value or "").strip()
+    return text_value or STUDENT_DEFAULT_MAJOR_DIRECTION
+
+
+def _ensure_user_major_direction_column():
+    try:
+        column_names = {c.get("name") for c in inspect(engine).get_columns("users")}
+        with engine.begin() as conn:
+            if "major_direction" not in column_names:
+                conn.execute(text("ALTER TABLE users ADD COLUMN major_direction VARCHAR(100)"))
+            conn.execute(
+                text(
+                    "UPDATE users SET major_direction = :direction "
+                    "WHERE role = 'student' AND (major_direction IS NULL OR trim(major_direction) = '')"
+                ),
+                {"direction": STUDENT_DEFAULT_MAJOR_DIRECTION},
+            )
+    except Exception:
+        pass
+
 
 models.Base.metadata.create_all(bind=engine)
+_ensure_user_major_direction_column()
+
 
 app = FastAPI(title="智能教学辅助系统 API", version="2.0.0")
 
@@ -249,8 +279,10 @@ def create_user(user: schemas.UserCreate, db: Session = Depends(get_db)):
         student_no=user.student_no,
         grade=user.grade,
         class_name=user.class_name,
+        major_direction=_normalize_student_major_direction(user.major_direction) if target_role == "student" else None,
         teacher_id=canonical_teacher_id
     )
+
     try:
         db.add(new_user)
         db.flush()
@@ -284,9 +316,11 @@ def list_students(db: Session = Depends(get_db)):
             "real_name": stu.real_name,
             "grade": stu.grade,
             "class_name": stu.class_name,
+            "major_direction": stu.major_direction,
             "teacher_id": stu.teacher_id,
             "teacher_name": tea.real_name if tea and tea.real_name else (tea.username if tea else None),
         }
+
         for stu, tea in rows
     ]
 
@@ -336,7 +370,10 @@ def login(user: schemas.UserLogin, db: Session = Depends(get_db)):
         "role": final_role,
         "username": db_user.username,
         "real_name": db_user.real_name,
+        "class_name": db_user.class_name,
+        "major_direction": db_user.major_direction,
     }
+
 
 # ================= 下面是你之前写好的业务接口 =================
 @app.post("/courses/")
@@ -989,7 +1026,165 @@ def _extract_text_from_doc(report_path: Path) -> str:
 
 
 
+def _can_use_pillow() -> bool:
+    try:
+        importlib.import_module("PIL.Image")
+        return True
+    except Exception:
+        return False
+
+
+
+def _can_use_image_ocr() -> bool:
+    if not _can_use_pillow():
+        return False
+    try:
+        importlib.import_module("pytesseract")
+        return True
+    except Exception:
+        return False
+
+
+
+def _build_thumbnail_preview_from_image_bytes(image_bytes: bytes, max_chars: int = 1600) -> str:
+    if (not image_bytes) or (not _can_use_pillow()):
+        return ""
+
+    try:
+        pil_image_module = importlib.import_module("PIL.Image")
+        img = pil_image_module.open(BytesIO(image_bytes))
+        width, height = img.size
+
+        if getattr(img, "mode", "") not in {"RGB", "L"}:
+            img = img.convert("RGB")
+
+        thumb = img.copy()
+        thumb.thumbnail((256, 256))
+        t_width, t_height = thumb.size
+
+        output = BytesIO()
+        thumb.save(output, format="JPEG", quality=70, optimize=True)
+        thumb_b64 = base64.b64encode(output.getvalue()).decode("utf-8")
+
+        if len(thumb_b64) > max_chars:
+            thumb_b64 = thumb_b64[:max_chars] + "...(截断)"
+
+        return f"data:image/jpeg;base64,{thumb_b64}（原图 {width}x{height}，缩略图 {t_width}x{t_height}）"
+    except Exception:
+        return ""
+
+
+
+def _ocr_text_from_image_bytes(image_bytes: bytes) -> str:
+    if (not image_bytes) or (not _can_use_image_ocr()):
+        return ""
+    try:
+        pil_image_module = importlib.import_module("PIL.Image")
+        pytesseract_module = importlib.import_module("pytesseract")
+        img = pil_image_module.open(BytesIO(image_bytes))
+        ocr_text = pytesseract_module.image_to_string(img, lang="chi_sim+eng")
+        text = re.sub(r"\s+", " ", str(ocr_text or "")).strip()
+        return text[:1200]
+    except Exception:
+        return ""
+
+
+
+def _build_image_context_line(page_label: str, figure_no: int, thumbnail_preview: str, ocr_text: str) -> str:
+    preview_text = (thumbnail_preview or "").strip() or "（缩略预览不可用：缺少 Pillow 或图片格式不支持）"
+    ocr_text_value = (ocr_text or "").strip() or "（OCR 未识别到可用文字）"
+    return (
+        f"- 图号: 图{figure_no} | 页码: {page_label}\n"
+        f"  - 图片原图缩略预览: {preview_text}\n"
+        f"  - OCR文本: {ocr_text_value}"
+    )
+
+
+
+def _extract_docx_image_ocr_sections(report_path: Path) -> list[str]:
+    sections: list[str] = []
+    try:
+        with zipfile.ZipFile(report_path, "r") as zf:
+            image_names = [
+                n for n in zf.namelist()
+                if n.startswith("word/media/") and Path(n).suffix.lower() in {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
+            ]
+            if not image_names:
+                return []
+
+            can_ocr = _can_use_image_ocr()
+            for idx, name in enumerate(image_names[:10], start=1):
+                image_bytes = zf.read(name)
+                thumbnail_preview = _build_thumbnail_preview_from_image_bytes(image_bytes)
+                text = _ocr_text_from_image_bytes(image_bytes) if can_ocr else ""
+                sections.append(
+                    _build_image_context_line(
+                        page_label="未知（docx 无稳定页码）",
+                        figure_no=idx,
+                        thumbnail_preview=thumbnail_preview,
+                        ocr_text=text if can_ocr else "（OCR 不可用：未安装 pytesseract/tesseract）",
+                    )
+                )
+    except Exception:
+        return []
+    return sections
+
+
+
+def _extract_pdf_image_ocr_sections(report_path: Path) -> list[str]:
+    sections: list[str] = []
+    PdfReader = None
+    try:
+        PdfReader = importlib.import_module("pypdf").PdfReader
+    except Exception:
+        try:
+            PdfReader = importlib.import_module("PyPDF2").PdfReader
+        except Exception:
+            return []
+
+    try:
+        reader = PdfReader(str(report_path))
+        image_count = 0
+        can_ocr = _can_use_image_ocr()
+
+        for page_index, page in enumerate(reader.pages, start=1):
+            page_images = getattr(page, "images", None)
+            if not page_images:
+                continue
+
+            for img in list(page_images)[:6]:
+                if len(sections) >= 10:
+                    break
+
+                image_count += 1
+                image_bytes = b""
+                try:
+                    image_bytes = getattr(img, "data", b"") or b""
+                except Exception:
+                    image_bytes = b""
+
+                if not image_bytes:
+                    continue
+
+                thumbnail_preview = _build_thumbnail_preview_from_image_bytes(image_bytes)
+                text = _ocr_text_from_image_bytes(image_bytes) if can_ocr else ""
+                sections.append(
+                    _build_image_context_line(
+                        page_label=f"第{page_index}页",
+                        figure_no=image_count,
+                        thumbnail_preview=thumbnail_preview,
+                        ocr_text=text if can_ocr else "（OCR 不可用：未安装 pytesseract/tesseract）",
+                    )
+                )
+    except Exception:
+        return []
+
+    return sections
+
+
+
 def _resolve_report_document_content(file_path: str) -> str:
+
     path_text = (file_path or "").strip()
     if not path_text:
         raise HTTPException(status_code=400, detail="报告文件路径为空")
@@ -999,10 +1194,13 @@ def _resolve_report_document_content(file_path: str) -> str:
         raise HTTPException(status_code=400, detail="报告文件不存在，请让学生重新提交")
 
     suffix = report_path.suffix.lower()
+    image_sections: list[str] = []
     if suffix == ".docx":
         content = _extract_text_from_docx(report_path)
+        image_sections = _extract_docx_image_ocr_sections(report_path)
     elif suffix == ".pdf":
         content = _extract_text_from_pdf(report_path)
+        image_sections = _extract_pdf_image_ocr_sections(report_path)
     elif suffix == ".doc":
         content = _extract_text_from_doc(report_path)
     else:
@@ -1012,10 +1210,17 @@ def _resolve_report_document_content(file_path: str) -> str:
     if not content:
         raise HTTPException(status_code=400, detail="报告文件未解析到有效正文")
 
-    if len(content) > 120000:
-        content = _shrink_text_keep_head_tail(content, 120000)
+    full_parts = [f"### 报告正文（自动抽取）\n{content}".strip()]
+    if image_sections:
+        full_parts.append("### 报告图片上下文（图片原图缩略预览 + OCR文本 + 页码/图号）\n" + "\n".join(image_sections))
 
-    return f"### 报告正文（自动抽取）\n{content}".strip()
+    full_content = "\n\n".join(full_parts).strip()
+
+    if len(full_content) > 120000:
+        full_content = _shrink_text_keep_head_tail(full_content, 120000)
+
+    return full_content
+
 
 
 
@@ -2211,8 +2416,10 @@ def admin_manage_classes(
                     "id": s.id,
                     "username": s.username,
                     "real_name": s.real_name,
-                    "student_no": s.student_no
+                    "student_no": s.student_no,
+                    "major_direction": s.major_direction
                 }
+
                 for s in students
             ]
         })
@@ -3607,8 +3814,303 @@ def get_teacher_dashboard_trend(
     }
 
 
+def _clamp_score_to_100(value: Optional[float]) -> float:
+    if value is None:
+        return 0.0
+    return max(0.0, min(100.0, float(value)))
+
+
+def _scale_sum_scores_to_100(scores: list[float]) -> float:
+    if not scores:
+        return 0.0
+    avg_score = sum(scores) / len(scores)
+    scaled = _clamp_score_to_100(avg_score)
+    return round(scaled, 2)
+
+
+def _parse_questionnaire_score(raw: Any) -> Optional[float]:
+    text_value = str(raw or "").strip()
+    if not text_value:
+        return None
+    try:
+        score = float(text_value)
+    except Exception:
+        return None
+    return _clamp_score_to_100(score)
+
+
+def _require_teacher_current_class(db: Session, teacher_id: int, class_id: int):
+    teacher = _require_teacher_user(db, teacher_id)
+    current = _get_current_semester(db)
+    if not current:
+        raise HTTPException(status_code=400, detail="当前学期未发布")
+
+    teaching_class = db.query(models.TeachingClass).filter(
+        models.TeachingClass.id == class_id,
+        models.TeachingClass.teacher_id == teacher.id,
+        models.TeachingClass.semester_id == current.id,
+    ).first()
+    if not teaching_class:
+        raise HTTPException(status_code=404, detail="未找到当前学期下该老师的班级")
+
+    return teacher, teaching_class
+
+
+THINKING_CLOUD_KEYWORDS = [
+    "问题", "提问", "分析", "论证", "推理", "假设", "验证", "证据", "因果", "逻辑",
+    "反思", "复盘", "优化", "改进", "迭代", "探索", "创新", "多角度", "批判性", "对比",
+    "权衡", "可行性", "风险", "方案", "模型", "结论", "why", "how",
+]
+
+
+def _build_thinking_cloud_words(report_subs: list[models.ReportSubmission]) -> dict:
+    text_chunks: list[str] = []
+
+    for sub in report_subs:
+        for piece in [sub.teacher_comment, sub.ai_feedback]:
+            text = str(piece or "").strip()
+            if text:
+                text_chunks.append(text)
+
+    full_text = "\n".join(text_chunks)
+    if not full_text:
+        return {"words": [], "source_report_count": len(report_subs)}
+
+    counter: Counter[str] = Counter()
+    lowered = full_text.lower()
+    for word in THINKING_CLOUD_KEYWORDS:
+        count = lowered.count(word.lower())
+        if count > 0:
+            counter[word] = count
+
+    if not counter:
+        return {"words": [], "source_report_count": len(report_subs)}
+
+    words = [
+        {"name": name, "value": value}
+        for name, value in counter.most_common(28)
+    ]
+    return {
+        "words": words,
+        "source_report_count": len(report_subs),
+    }
+
+
+def _build_teacher_class_learning_stats(db: Session, teacher_id: int, class_id: int):
+
+    teacher, teaching_class = _require_teacher_current_class(db, teacher_id, class_id)
+    students = _get_students_for_class(db, teaching_class)
+    student_ids = [s.id for s in students]
+    student_id_set = set(student_ids)
+
+    assignments = db.query(models.Assignment).filter(
+        models.Assignment.course_id == class_id
+    ).order_by(models.Assignment.id.asc()).all()
+
+    completion_items = []
+    assignment_scores: list[float] = []
+    total_students = len(student_ids)
+
+    for item in assignments:
+        subs = db.query(models.Submission).filter(
+            models.Submission.assignment_id == item.id,
+            models.Submission.student_id.in_(student_ids) if student_ids else False,
+        ).all() if student_ids else []
+
+        finished_student_ids = {s.student_id for s in subs if s.status == "finished"}
+        finished_count = len(finished_student_ids)
+        completion_rate = round((finished_count / total_students) * 100, 2) if total_students else 0.0
+
+        completion_items.append({
+            "item_id": item.id,
+            "item_name": item.title,
+            "finished_count": finished_count,
+            "total_count": total_students,
+            "completion_rate": completion_rate,
+        })
+
+        for sub in subs:
+            if sub.status == "finished" and sub.score is not None:
+                assignment_scores.append(float(sub.score))
+
+    report_scores: list[float] = []
+    reviewed_report_subs: list[models.ReportSubmission] = []
+    report_task_ids = [x.id for x in db.query(models.ReportTask.id).filter(models.ReportTask.class_id == class_id).all()]
+    if report_task_ids and student_ids:
+        reviewed_report_subs = db.query(models.ReportSubmission).filter(
+            models.ReportSubmission.report_task_id.in_(report_task_ids),
+            models.ReportSubmission.student_id.in_(student_ids),
+            models.ReportSubmission.score.is_not(None),
+        ).all()
+        report_scores = [float(x.score) for x in reviewed_report_subs if x.score is not None]
+
+    academic_component = _scale_sum_scores_to_100(assignment_scores + report_scores)
+    thinking_cloud = _build_thinking_cloud_words(reviewed_report_subs)
+
+
+    survey_rows = db.query(models.ClassLearningSurvey).filter(
+        models.ClassLearningSurvey.class_id == class_id,
+        models.ClassLearningSurvey.teacher_id == teacher.id,
+    ).all()
+
+    survey_rows = [x for x in survey_rows if x.student_id in student_id_set]
+
+    def _avg_non_empty(items: list[Optional[int]]) -> float:
+        vals = [float(v) for v in items if v is not None]
+        return round(sum(vals) / len(vals), 2) if vals else 0.0
+
+    questionnaire_analysis = _avg_non_empty([x.analysis_score for x in survey_rows])
+    questionnaire_open_mind = _avg_non_empty([x.open_mind_score for x in survey_rows])
+    questionnaire_confidence = _avg_non_empty([x.thinking_confidence_score for x in survey_rows])
+
+    analysis_ability = round(academic_component * 0.8 + questionnaire_analysis * 0.2, 2)
+
+    latest_upload_time = max([x.updated_at for x in survey_rows if x.updated_at is not None], default=None)
+
+    return {
+        "class_id": teaching_class.id,
+        "class_name": teaching_class.name,
+        "completion_items": completion_items,
+        "radar": {
+            "analysis_ability": _clamp_score_to_100(analysis_ability),
+            "open_mind": _clamp_score_to_100(questionnaire_open_mind),
+            "thinking_confidence": _clamp_score_to_100(questionnaire_confidence),
+            "components": {
+                "academic_analysis": academic_component,
+                "questionnaire_analysis": questionnaire_analysis,
+                "questionnaire_open_mind": questionnaire_open_mind,
+                "questionnaire_thinking_confidence": questionnaire_confidence,
+            },
+        },
+        "questionnaire": {
+            "uploaded_count": len(survey_rows),
+            "total_students": total_students,
+            "latest_upload_time": latest_upload_time,
+        },
+        "thinking_cloud": thinking_cloud,
+    }
+
+
+
+@app.get("/teachers/{teacher_id}/classes/{class_id}/learning-stats")
+def get_teacher_class_learning_stats(teacher_id: int, class_id: int, db: Session = Depends(get_db)):
+    return _build_teacher_class_learning_stats(db, teacher_id, class_id)
+
+
+@app.get("/teachers/{teacher_id}/classes/{class_id}/learning-stats/template")
+def download_teacher_class_learning_survey_template(teacher_id: int, class_id: int, db: Session = Depends(get_db)):
+    _ensure_openpyxl()
+    _teacher, teaching_class = _require_teacher_current_class(db, teacher_id, class_id)
+
+    students = _get_students_for_class(db, teaching_class)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "learning_survey"
+    ws.append(["student_id", "student_no", "real_name", "analysis_score", "open_mind_score", "thinking_confidence_score"])
+
+    for stu in students:
+        ws.append([
+            stu.id,
+            stu.student_no,
+            stu.real_name or stu.username,
+            "",
+            "",
+            "",
+        ])
+
+    output = BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return StreamingResponse(
+        output,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename=class_{class_id}_learning_survey_template.xlsx"},
+    )
+
+
+@app.post("/teachers/{teacher_id}/classes/{class_id}/learning-stats/import")
+async def import_teacher_class_learning_survey(teacher_id: int, class_id: int, file: UploadFile = File(...), db: Session = Depends(get_db)):
+    _ensure_openpyxl()
+    teacher, teaching_class = _require_teacher_current_class(db, teacher_id, class_id)
+
+    if not file.filename.lower().endswith(".xlsx"):
+        raise HTTPException(status_code=400, detail="仅支持 .xlsx 文件")
+
+    content = await file.read()
+    wb = load_workbook(filename=BytesIO(content), data_only=True)
+    ws = wb.active
+
+    students = _get_students_for_class(db, teaching_class)
+    student_by_id = {s.id: s for s in students}
+    student_by_no = {str(s.student_no).strip(): s for s in students if s.student_no}
+
+    created = 0
+    updated = 0
+    skipped = 0
+
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        row_values = (list(row[:6]) + [None] * 6)[:6]
+        student_id_raw, student_no_raw, _name_raw, a_raw, o_raw, c_raw = row_values
+
+        student_obj = None
+        if student_id_raw not in [None, ""]:
+            try:
+                sid = int(student_id_raw)
+                student_obj = student_by_id.get(sid)
+            except Exception:
+                student_obj = None
+        if student_obj is None and student_no_raw not in [None, ""]:
+            student_obj = student_by_no.get(str(student_no_raw).strip())
+
+        if student_obj is None:
+            skipped += 1
+            continue
+
+        analysis_score = _parse_questionnaire_score(a_raw)
+        open_mind_score = _parse_questionnaire_score(o_raw)
+        confidence_score = _parse_questionnaire_score(c_raw)
+
+        if analysis_score is None and open_mind_score is None and confidence_score is None:
+            skipped += 1
+            continue
+
+        item = db.query(models.ClassLearningSurvey).filter(
+            models.ClassLearningSurvey.class_id == class_id,
+            models.ClassLearningSurvey.student_id == student_obj.id,
+            models.ClassLearningSurvey.teacher_id == teacher.id,
+        ).first()
+
+        if not item:
+            item = models.ClassLearningSurvey(
+                class_id=class_id,
+                student_id=student_obj.id,
+                teacher_id=teacher.id,
+            )
+            db.add(item)
+            created += 1
+        else:
+            updated += 1
+
+        item.analysis_score = int(round(analysis_score)) if analysis_score is not None else None
+        item.open_mind_score = int(round(open_mind_score)) if open_mind_score is not None else None
+        item.thinking_confidence_score = int(round(confidence_score)) if confidence_score is not None else None
+        item.updated_at = datetime.now(timezone.utc)
+
+    db.commit()
+
+    return {
+        "message": "问卷导入完成",
+        "created": created,
+        "updated": updated,
+        "skipped": skipped,
+        "stats": _build_teacher_class_learning_stats(db, teacher_id, class_id),
+    }
+
+
 @app.get("/classes/{class_id}/analytics/student_ranking")
 def get_class_student_ranking(class_id: int, db: Session = Depends(get_db)):
+
     teaching_class = db.query(models.TeachingClass).filter(models.TeachingClass.id == class_id).first()
     if not teaching_class:
         raise HTTPException(status_code=404, detail="班级不存在")
@@ -3958,6 +4460,7 @@ def admin_delete_teacher(teacher_id: int, db: Session = Depends(get_db)):
 def admin_list_students(
     grade: Optional[str] = Query(default=None),
     class_name: Optional[str] = Query(default=None),
+    major_direction: Optional[str] = Query(default=None),
     username: Optional[str] = Query(default=None),
     student_no: Optional[str] = Query(default=None),
     real_name: Optional[str] = Query(default=None),
@@ -3965,12 +4468,16 @@ def admin_list_students(
     teacher_name: Optional[str] = Query(default=None),
     db: Session = Depends(get_db)
 ):
+
     q = db.query(models.User).filter(models.User.role == "student")
 
     if grade:
         q = q.filter(models.User.grade.ilike(f"%{grade}%"))
+    if major_direction:
+        q = q.filter(models.User.major_direction.ilike(f"%{major_direction}%"))
     if username:
         q = q.filter(models.User.username.ilike(f"%{username}%"))
+
     if student_no:
         q = q.filter(models.User.student_no.ilike(f"%{student_no}%"))
     if real_name:
@@ -4032,9 +4539,11 @@ def admin_list_students(
                     "real_name": stu.real_name,
                     "grade": stu.grade,
                     "class_name": rel.name,
+                    "major_direction": _normalize_student_major_direction(stu.major_direction),
                     "teacher_id": rel.teacher_id,
                     "teacher_name": final_teacher_name,
                 })
+
             continue
 
         fallback_teacher = teacher_map.get(stu.teacher_id) if stu.teacher_id else None
@@ -4056,9 +4565,12 @@ def admin_list_students(
             "real_name": stu.real_name,
             "grade": stu.grade,
             "class_name": stu.class_name,
+            "major_direction": _normalize_student_major_direction(stu.major_direction),
             "teacher_id": stu.teacher_id,
             "teacher_name": fallback_teacher_name,
         })
+
+
 
     return result
 
@@ -4084,8 +4596,10 @@ def admin_create_student(payload: schemas.StudentCreate, db: Session = Depends(g
         student_no=payload.student_no,
         grade=payload.grade,
         class_name=payload.class_name,
+        major_direction=_normalize_student_major_direction(payload.major_direction),
         teacher_id=canonical_teacher_id,
     )
+
     try:
         db.add(item)
         db.flush()
@@ -4127,7 +4641,10 @@ def admin_update_student(student_id: int, payload: schemas.StudentUpdate, db: Se
         item.grade = payload.grade
     if payload.class_name is not None:
         item.class_name = payload.class_name
+    if payload.major_direction is not None:
+        item.major_direction = _normalize_student_major_direction(payload.major_direction)
     if payload.teacher_id is not None:
+
         canonical_teacher_id = _canonical_teacher_id(db, payload.teacher_id)
         if canonical_teacher_id is None:
             raise HTTPException(status_code=400, detail="归属老师不存在")
@@ -4197,9 +4714,11 @@ def teacher_student_list(
             "real_name": u.real_name,
             "grade": u.grade,
             "class_name": u.class_name,
+            "major_direction": u.major_direction,
             "teacher_id": teacher_id,
             "teacher_name": teacher.real_name or teacher.username,
         }
+
         for u in items
     ]
 
@@ -4234,8 +4753,9 @@ def student_template():
     wb = Workbook()
     ws = wb.active
     ws.title = "students"
-    ws.append(["username", "password", "student_no", "real_name", "grade", "class_name", "teacher_username"])
-    ws.append(["stu001", "123456", "20260001", "李同学", "2026", "软件1班", "teacher001"])
+    ws.append(["username", "password", "student_no", "real_name", "grade", "class_name", "major_direction", "teacher_username"])
+    ws.append(["stu001", "123456", "20260001", "李同学", "2026", "软件1班", "人工智能+复合型创新", "teacher001"])
+
 
 
     output = BytesIO()
@@ -4324,14 +4844,23 @@ async def import_students(file: UploadFile = File(...), db: Session = Depends(ge
     created = 0
     skipped = 0
     for idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
-        username, password, student_no, real_name, grade, class_name, teacher_username = row[:7]
+        row_values = list(row)
+        if len(row_values) >= 8:
+            username, password, student_no, real_name, grade, class_name, major_direction, teacher_username = row_values[:8]
+        else:
+            username, password, student_no, real_name, grade, class_name, teacher_username = (row_values[:7] + [None] * 7)[:7]
+            major_direction = None
+
         username = str(username or "").strip()
         password = str(password or "").strip()
         student_no = str(student_no or "").strip() or None
         real_name = str(real_name or "").strip() or None
         grade = str(grade or "").strip() or None
         class_name = str(class_name or "").strip() or None
+        major_direction = _normalize_student_major_direction(str(major_direction or "").strip() or None)
         teacher_username = str(teacher_username or "").strip() or None
+
+
 
 
         if not username or not password:
@@ -4362,8 +4891,10 @@ async def import_students(file: UploadFile = File(...), db: Session = Depends(ge
             student_no=student_no,
             grade=grade,
             class_name=class_name,
+            major_direction=major_direction,
             teacher_id=teacher_id,
         ))
+
         created += 1
 
     db.commit()
@@ -4540,7 +5071,9 @@ def _get_project_team_member_users(db: Session, team_id: int):
             "real_name": u.real_name,
             "student_no": u.student_no,
             "class_name": u.class_name,
+            "major_direction": u.major_direction,
         })
+
     return rows
 
 
@@ -5135,9 +5668,12 @@ def student_search_project_students(
     keyword: str = Query(...),
     db: Session = Depends(get_db)
 ):
-    _ = db.query(models.User).filter(models.User.id == student_id, models.User.role == "student").first()
-    if not _:
+    student = db.query(models.User).filter(models.User.id == student_id, models.User.role == "student").first()
+    if not student:
         raise HTTPException(status_code=404, detail="学生不存在")
+
+    my_direction = _normalize_student_major_direction(student.major_direction)
+
 
     links = db.query(models.ClassStudent).filter(models.ClassStudent.class_id == class_id).all()
     student_ids = [x.student_id for x in links]
@@ -5165,7 +5701,9 @@ def student_search_project_students(
             "real_name": s.real_name,
             "student_no": s.student_no,
             "class_name": s.class_name,
+            "major_direction": s.major_direction,
         }
+
         for s in rows
     ]
 
@@ -5221,8 +5759,10 @@ def student_create_project_team(student_id: int, payload: schemas.ProjectTeamCre
     _ensure_student_single_team_in_semester(db, student_id, current.id)
 
     direction = payload.direction.strip()
-    if student.class_name and direction != student.class_name:
+    student_direction = _normalize_student_major_direction(student.major_direction)
+    if direction != student_direction:
         raise HTTPException(status_code=400, detail="队伍方向需与队长专业方向一致")
+
 
     team = models.ProjectTeam(
         semester_id=current.id,
@@ -5277,8 +5817,9 @@ def student_add_project_team_member(
     if not class_link:
         raise HTTPException(status_code=400, detail="该学生不在同一班级")
 
-    if (member_user.class_name or "") != team.direction:
+    if _normalize_student_major_direction(member_user.major_direction) != team.direction:
         raise HTTPException(status_code=400, detail="该学生专业方向与队伍方向不一致")
+
 
     _ensure_student_single_team_in_semester(db, payload.student_id, team.semester_id)
 

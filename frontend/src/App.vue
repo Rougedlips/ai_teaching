@@ -91,6 +91,10 @@
               <el-icon><Setting /></el-icon>
               <span>管理员中心</span>
             </el-menu-item>
+            <el-menu-item v-if="userRole === 'admin'" index="/admin-project-management">
+              <el-icon><Files /></el-icon>
+              <span>综合项目管理</span>
+            </el-menu-item>
           </template>
 
           <template v-if="userRole === 'student'">

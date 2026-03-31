@@ -15,7 +15,9 @@
         <template #title>
           组队开关：{{ entry.setting.is_enabled ? '开启' : '关闭' }}；
           组队时段：{{ entry.setting.open_start || '-' }} ~ {{ entry.setting.open_end || '-' }}；
-          人数限制：{{ entry.setting.min_team_size }} - {{ entry.setting.max_team_size }} 人
+          人数限制：{{ entry.setting.min_team_size }} - {{ entry.setting.max_team_size }} 人；
+          我的专业方向：{{ entry.student_major_direction || '-' }}
+
         </template>
       </el-alert>
 
@@ -84,7 +86,8 @@
           </el-select>
         </el-form-item>
         <el-form-item label="队伍名称"><el-input v-model="createTeamForm.team_name" /></el-form-item>
-        <el-form-item label="专业方向"><el-input v-model="createTeamForm.direction" placeholder="需与个人方向一致" /></el-form-item>
+        <el-form-item label="专业方向"><el-input v-model="createTeamForm.direction" disabled /></el-form-item>
+
       </el-form>
       <template #footer>
         <el-button @click="createTeamDialogVisible = false">取消</el-button>
@@ -104,8 +107,10 @@
           <el-table :data="searchResults" style="width:100%" max-height="260">
             <el-table-column prop="student_no" label="学号" width="140" />
             <el-table-column prop="real_name" label="姓名" width="120" />
+            <el-table-column prop="major_direction" label="专业方向" width="180" />
             <el-table-column prop="username" label="账号" min-width="120" />
             <el-table-column label="操作" width="100">
+
               <template #default="scope"><el-button link type="primary" @click="addMember(scope.row.id)">添加</el-button></template>
             </el-table-column>
           </el-table>
@@ -168,9 +173,10 @@ fetchAll()
 const openCreateTeamDialog = () => {
   createTeamForm.class_id = entry.classes?.[0]?.id || 0
   createTeamForm.team_name = ''
-  createTeamForm.direction = localStorage.getItem('class_name') || ''
+  createTeamForm.direction = entry.student_major_direction || localStorage.getItem('major_direction') || ''
   createTeamDialogVisible.value = true
 }
+
 
 const createTeam = async () => {
   if (!createTeamForm.class_id) return ElMessage.warning('请选择所属班级')

@@ -5,16 +5,7 @@
         <div class="header-row">
           <div>
             <div class="title-row">
-              <div class="title">👨‍🎓 学生管理</div>
-              <el-button
-                v-if="currentClassId"
-                type="primary"
-                plain
-                size="small"
-                @click="openClassAnalytics"
-              >
-                学情统计
-              </el-button>
+              <div class="title">学生管理</div>
             </div>
             <div class="sub-title" v-if="currentClassMeta">当前班级：{{ currentClassMeta.name }}</div>
           </div>
@@ -89,18 +80,44 @@
               </el-col>
             </el-row>
           </el-tab-pane>
+
+          <el-tab-pane label="学情统计" name="learning">
+            <div class="toolbar">
+              <el-button @click="downloadLearningTemplate">下载问卷模板</el-button>
+              <el-upload :show-file-list="false" :http-request="uploadLearningSurvey" accept=".xlsx">
+                <el-button type="primary" plain>上传问卷</el-button>
+              </el-upload>
+              <el-tag type="info">已上传 {{ learningStats.questionnaire.uploaded_count }} / {{ learningStats.questionnaire.total_students }}</el-tag>
+            </div>
+
+            <el-row :gutter="16" v-loading="learningLoading">
+              <el-col :span="12">
+                <el-card shadow="never" class="chart-card">
+                  <template #header><span>作业项目完成趋势</span></template>
+                  <div ref="completionChartRef" class="chart-box"></div>
+                </el-card>
+              </el-col>
+              <el-col :span="12">
+                <el-card shadow="never" class="chart-card">
+                  <template #header><span>思维雷达</span></template>
+                  <div ref="radarChartRef" class="chart-box radar-chart-box"></div>
+                </el-card>
+              </el-col>
+            </el-row>
+
+            <el-card shadow="never" class="chart-card cloud-card" v-loading="learningLoading">
+              <template #header>
+                <div class="cloud-header">
+                  <span>思维云图</span>
+                  <el-tag size="small" type="info">已分析报告：{{ learningStats.thinking_cloud.source_report_count }}</el-tag>
+                </div>
+              </template>
+              <div ref="thinkingCloudChartRef" class="cloud-chart-box"></div>
+            </el-card>
+          </el-tab-pane>
         </el-tabs>
       </template>
     </el-card>
-
-    <el-dialog v-model="rankingVisible" title="班级学情统计" width="560px">
-      <el-table :data="rankingRows" stripe v-loading="rankingLoading">
-        <el-table-column type="index" label="排名" width="70" />
-        <el-table-column prop="name" label="姓名" />
-        <el-table-column prop="count" label="已批改次数" width="110" />
-        <el-table-column prop="score" label="平均分" width="100" />
-      </el-table>
-    </el-dialog>
 
     <el-dialog v-model="transferVisible" title="调整成员队伍" width="460px">
       <el-form label-width="90px">
@@ -124,9 +141,11 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, ref, watch, nextTick, onBeforeUnmount } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import type { UploadRequestOptions } from 'element-plus'
+import * as echarts from 'echarts'
 import axios from 'axios'
 
 interface ClassItem {
@@ -146,7 +165,40 @@ interface StudentItem {
   scores: Record<string, number | null>
 }
 interface TeamItem { id: number; name: string; members: number[] }
-interface RankingItem { name: string; count: number; score: number }
+interface LearningCompletionItem {
+  item_id: number
+  item_name: string
+  finished_count: number
+  total_count: number
+  completion_rate: number
+}
+interface ThinkingCloudWord {
+  name: string
+  value: number
+}
+interface LearningStatsResponse {
+  completion_items: LearningCompletionItem[]
+  radar: {
+    analysis_ability: number
+    open_mind: number
+    thinking_confidence: number
+    components: {
+      academic_analysis: number
+      questionnaire_analysis: number
+      questionnaire_open_mind: number
+      questionnaire_thinking_confidence: number
+    }
+  }
+  questionnaire: {
+    uploaded_count: number
+    total_students: number
+    latest_upload_time: string | null
+  }
+  thinking_cloud: {
+    words: ThinkingCloudWord[]
+    source_report_count: number
+  }
+}
 
 const route = useRoute()
 const router = useRouter()
@@ -162,11 +214,38 @@ const teams = ref<TeamItem[]>([])
 
 const loadingOverview = ref(false)
 const loadingTeams = ref(false)
+const learningLoading = ref(false)
 const transferVisible = ref(false)
 const transferForm = ref({ studentId: 0, targetTeamId: 0 })
-const rankingVisible = ref(false)
-const rankingLoading = ref(false)
-const rankingRows = ref<RankingItem[]>([])
+const learningStats = ref<LearningStatsResponse>({
+  completion_items: [],
+  radar: {
+    analysis_ability: 0,
+    open_mind: 0,
+    thinking_confidence: 0,
+    components: {
+      academic_analysis: 0,
+      questionnaire_analysis: 0,
+      questionnaire_open_mind: 0,
+      questionnaire_thinking_confidence: 0,
+    },
+  },
+  questionnaire: {
+    uploaded_count: 0,
+    total_students: 0,
+    latest_upload_time: null,
+  },
+  thinking_cloud: {
+    words: [],
+    source_report_count: 0,
+  },
+})
+const completionChartRef = ref<HTMLDivElement | null>(null)
+const radarChartRef = ref<HTMLDivElement | null>(null)
+const thinkingCloudChartRef = ref<HTMLDivElement | null>(null)
+let completionChart: echarts.ECharts | null = null
+let radarChart: echarts.ECharts | null = null
+let thinkingCloudChart: echarts.ECharts | null = null
 
 const currentClassId = computed(() => Number(route.params.classId || 0))
 const currentClassMeta = computed(() => classes.value.find((c) => c.id === currentClassId.value) || null)
@@ -202,6 +281,7 @@ const fetchClassOverview = async () => {
       assignments.value = res.data.assignments || []
       students.value = res.data.students || []
       teams.value = res.data.teams || []
+      await fetchLearningStats()
       return
     }
 
@@ -212,10 +292,13 @@ const fetchClassOverview = async () => {
     assignments.value = overviewRes.data.assignments || []
     students.value = overviewRes.data.students || []
     teams.value = teamsRes.data || []
+    learningStats.value.completion_items = []
   } catch {
     assignments.value = []
     students.value = []
     teams.value = []
+    learningStats.value.completion_items = []
+    learningStats.value.thinking_cloud = { words: [], source_report_count: 0 }
     throw new Error('overview_failed')
   } finally {
     loadingOverview.value = false
@@ -266,6 +349,28 @@ watch(() => route.path, async () => {
   await fetchAll()
 }, { immediate: true })
 
+watch(() => activeTab.value, async (tab) => {
+  if (tab === 'learning') {
+    await fetchLearningStats()
+  }
+})
+
+const onResize = () => {
+  completionChart?.resize()
+  radarChart?.resize()
+}
+
+window.addEventListener('resize', onResize)
+onBeforeUnmount(() => {
+  window.removeEventListener('resize', onResize)
+  completionChart?.dispose()
+  radarChart?.dispose()
+  thinkingCloudChart?.dispose()
+  completionChart = null
+  radarChart = null
+  thinkingCloudChart = null
+})
+
 const getScore = (student: StudentItem, assignmentId: number) => {
   const v = student.scores[String(assignmentId)]
   return v == null ? '-' : v
@@ -276,16 +381,221 @@ const getStudentName = (studentId: number) => {
   return s ? s.name : `学生${studentId}`
 }
 
-const openClassAnalytics = async () => {
-  if (!currentClassId.value) return
-  rankingVisible.value = true
-  rankingLoading.value = true
+const renderCompletionChart = () => {
+  if (!completionChartRef.value) return
+  if (!completionChart) completionChart = echarts.init(completionChartRef.value)
 
+  const labels = learningStats.value.completion_items.map((x) => x.item_name)
+  const values = learningStats.value.completion_items.map((x) => x.completion_rate)
+
+  completionChart.setOption({
+    tooltip: { trigger: 'axis' },
+    grid: { left: 42, right: 20, top: 24, bottom: 60 },
+    xAxis: {
+      type: 'category',
+      boundaryGap: false,
+      data: labels,
+      axisLabel: { interval: 0, rotate: labels.length > 5 ? 25 : 0 }
+    },
+    yAxis: {
+      type: 'value',
+      min: 0,
+      max: 100,
+      axisLabel: { formatter: '{value}%' }
+    },
+    series: [
+      {
+        name: '完成度',
+        type: 'line',
+        smooth: true,
+        symbol: 'circle',
+        symbolSize: 8,
+        data: values,
+        lineStyle: { color: '#4f7cff', width: 3 },
+        itemStyle: { color: '#4f7cff' },
+        areaStyle: { color: 'rgba(79,124,255,0.16)' },
+        label: {
+          show: true,
+          position: 'top',
+          formatter: ({ value }: { value: number }) => `${value}%`
+        }
+      }
+    ]
+  })
+}
+
+const renderRadarChart = () => {
+  if (!radarChartRef.value) return
+  if (!radarChart) radarChart = echarts.init(radarChartRef.value)
+
+  const radar = learningStats.value.radar
+
+  radarChart.setOption({
+    legend: {
+      top: 8,
+      left: 'center',
+      itemWidth: 18,
+      itemHeight: 10,
+      textStyle: { fontSize: 14 },
+      data: ['综合得分', '问卷得分']
+    },
+    radar: {
+      radius: 170,
+      center: ['50%', '64%'],
+      splitNumber: 5,
+      indicator: [
+        { name: '分析能力', max: 100 },
+        { name: '开放\n思想', max: 100 },
+        { name: '思维\n自信', max: 100 },
+      ],
+      axisName: { color: '#45556d', fontSize: 16, lineHeight: 20 },
+      splitArea: { areaStyle: { color: ['#f8faff', '#f2f6ff'] } },
+      splitLine: { lineStyle: { color: '#dbe5ff' } },
+      axisLine: { lineStyle: { color: '#c9d8ff' } }
+    },
+    series: [
+      {
+        type: 'radar',
+        data: [
+          {
+            value: [radar.analysis_ability, radar.open_mind, radar.thinking_confidence],
+            name: '综合得分',
+            lineStyle: { color: '#6786ff', width: 2 },
+            areaStyle: { color: 'rgba(103,134,255,0.22)' },
+            symbolSize: 6,
+          },
+          {
+            value: [
+              radar.components.questionnaire_analysis,
+              radar.components.questionnaire_open_mind,
+              radar.components.questionnaire_thinking_confidence,
+            ],
+            name: '问卷得分',
+            lineStyle: { color: '#ff8d4d', width: 2, type: 'dashed' },
+            areaStyle: { color: 'rgba(255,141,77,0.18)' },
+            symbolSize: 6,
+          }
+        ]
+      }
+    ]
+  })
+  radarChart.resize()
+}
+
+const renderThinkingCloudChart = () => {
+  if (!thinkingCloudChartRef.value) return
+  if (!thinkingCloudChart) thinkingCloudChart = echarts.init(thinkingCloudChartRef.value)
+
+  const words = learningStats.value.thinking_cloud.words || []
+  if (!words.length) {
+    thinkingCloudChart.setOption({
+      title: {
+        text: '暂无可展示关键词（请先完成报告评测）',
+        left: 'center',
+        top: 'middle',
+        textStyle: { color: '#94a3b8', fontSize: 14, fontWeight: 500 }
+      },
+      xAxis: { show: false, min: 0, max: 100 },
+      yAxis: { show: false, min: 0, max: 100 },
+      series: []
+    })
+    thinkingCloudChart.resize()
+    return
+  }
+
+  const maxVal = Math.max(...words.map((x) => Number(x.value) || 0), 1)
+  const palette = ['#4f7cff', '#7a5cff', '#14b8a6', '#f59e0b', '#ef4444', '#6366f1', '#06b6d4']
+  const points = words.map((w, idx) => {
+    const angle = (idx * 137.5 * Math.PI) / 180
+    const r = 8 + (idx / Math.max(words.length, 1)) * 42
+    const x = 50 + Math.cos(angle) * r
+    const y = 50 + Math.sin(angle) * r * 0.72
+    const size = 16 + (Number(w.value) / maxVal) * 22
+    return {
+      value: [x, y, Number(w.value)],
+      name: w.name,
+      symbolSize: size,
+      itemStyle: { color: 'transparent' },
+      label: {
+        show: true,
+        formatter: `${w.name}`,
+        color: palette[idx % palette.length],
+        fontSize: Math.round(size),
+        fontWeight: Number(w.value) >= maxVal * 0.65 ? 'bold' : 'normal'
+      }
+    }
+  })
+
+  thinkingCloudChart.setOption({
+    tooltip: {
+      trigger: 'item',
+      formatter: (params: any) => `${params.name}<br/>出现次数：${params.value?.[2] ?? 0}`
+    },
+    xAxis: { show: false, min: 0, max: 100 },
+    yAxis: { show: false, min: 0, max: 100 },
+    grid: { left: 0, right: 0, top: 0, bottom: 0 },
+    series: [
+      {
+        type: 'scatter',
+        data: points,
+        emphasis: { scale: true }
+      }
+    ]
+  })
+  thinkingCloudChart.resize()
+}
+
+const fetchLearningStats = async () => {
+  if (!currentClassId.value || currentRole !== 'teacher') {
+    learningStats.value.completion_items = []
+    learningStats.value.thinking_cloud = { words: [], source_report_count: 0 }
+    return
+  }
+  learningLoading.value = true
   try {
-    const res = await axios.get(`http://127.0.0.1:8000/classes/${currentClassId.value}/analytics/student_ranking`)
-    rankingRows.value = res.data || []
+    const res = await axios.get(`http://127.0.0.1:8000/teachers/${currentUserId}/classes/${currentClassId.value}/learning-stats`)
+    learningStats.value = res.data
+    await nextTick()
+    renderCompletionChart()
+    renderRadarChart()
+    renderThinkingCloudChart()
   } finally {
-    rankingLoading.value = false
+    learningLoading.value = false
+  }
+}
+
+const downloadLearningTemplate = async () => {
+  if (!currentClassId.value || currentRole !== 'teacher') return
+  const res = await axios.get(
+    `http://127.0.0.1:8000/teachers/${currentUserId}/classes/${currentClassId.value}/learning-stats/template`,
+    { responseType: 'blob' }
+  )
+  const blob = new Blob([res.data], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `class_${currentClassId.value}_learning_survey_template.xlsx`
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  URL.revokeObjectURL(url)
+}
+
+const uploadLearningSurvey = async (options: UploadRequestOptions) => {
+  if (!currentClassId.value || currentRole !== 'teacher') return
+  try {
+    const formData = new FormData()
+    formData.append('file', options.file)
+    const res = await axios.post(
+      `http://127.0.0.1:8000/teachers/${currentUserId}/classes/${currentClassId.value}/learning-stats/import`,
+      formData
+    )
+    ElMessage.success(`导入完成：新增 ${res.data.created} 条，更新 ${res.data.updated} 条，跳过 ${res.data.skipped} 条`)
+    options.onSuccess?.(res.data)
+    await fetchLearningStats()
+  } catch (e: any) {
+    ElMessage.error(String(e?.response?.data?.detail || '问卷导入失败'))
+    options.onError?.(e)
   }
 }
 
@@ -372,10 +682,16 @@ const transferMember = async () => {
 .title-row { display: flex; align-items: center; gap: 10px; }
 .title { font-size: 18px; font-weight: 700; color: #1f2937; }
 .sub-title { color: #64748b; margin-top: 4px; }
-.toolbar { margin-bottom: 14px; display: flex; gap: 10px; }
+.toolbar { margin-bottom: 14px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
 .team-card { margin-bottom: 16px; }
 .team-head { display: flex; justify-content: space-between; align-items: center; }
 .member-tags { margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap; }
 .score-grid { display: flex; flex-direction: column; gap: 8px; }
 .score-row { display: flex; justify-content: space-between; align-items: center; }
+.chart-card { border: 1px solid #eef2ff; border-radius: 10px; }
+.cloud-card { margin-top: 16px; }
+.cloud-header { display: flex; justify-content: space-between; align-items: center; }
+.chart-box { width: 100%; height: 360px; }
+.radar-chart-box { height: 560px; }
+.cloud-chart-box { width: 100%; height: 360px; }
 </style>

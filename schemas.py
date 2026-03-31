@@ -10,8 +10,10 @@ class UserCreate(BaseModel):
     student_no: Optional[str] = None
     grade: Optional[str] = None
     class_name: Optional[str] = None
+    major_direction: Optional[str] = None
     teacher_id: Optional[int] = None
     is_admin: bool = False
+
 
 
 class UserLogin(BaseModel):
@@ -169,7 +171,9 @@ class StudentCreate(BaseModel):
     real_name: Optional[str] = None
     grade: Optional[str] = None
     class_name: Optional[str] = None
+    major_direction: Optional[str] = None
     teacher_id: Optional[int] = None
+
 
 
 class StudentUpdate(BaseModel):
@@ -179,7 +183,9 @@ class StudentUpdate(BaseModel):
     real_name: Optional[str] = None
     grade: Optional[str] = None
     class_name: Optional[str] = None
+    major_direction: Optional[str] = None
     teacher_id: Optional[int] = None
+
 
 
 class PasswordReset(BaseModel):

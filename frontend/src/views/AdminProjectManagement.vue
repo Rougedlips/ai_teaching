@@ -151,7 +151,7 @@
         </el-form-item>
         <el-form-item label="队员">
           <el-select v-model="teamForm.member_ids" multiple filterable style="width:100%">
-            <el-option v-for="s in classStudents" :key="s.id" :label="`${s.real_name || s.username}（${s.student_no || s.id}）`" :value="s.id" />
+            <el-option v-for="s in classStudents" :key="s.id" :label="`${s.real_name || s.username}（${s.student_no || s.id}） ${s.major_direction || ''}`" :value="s.id" />
           </el-select>
         </el-form-item>
       </el-form>

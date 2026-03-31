@@ -3,7 +3,7 @@
     <el-card class="login-card">
       <template #header>
         <div class="login-header">
-          <span style="font-size: 24px;">⚡ 智能教学辅助系统</span>
+          <span style="font-size: 24px;">EduAI Project辅助教学管理平台</span>
         </div>
       </template>
       
@@ -79,6 +79,9 @@ const handleLogin = async () => {
       localStorage.setItem('username', res.data.username);
       localStorage.setItem('real_name', res.data.real_name || '');
       localStorage.setItem('role', backendRole);
+      localStorage.setItem('class_name', res.data.class_name || '');
+      localStorage.setItem('major_direction', res.data.major_direction || '');
+
 
       ElMessage.success('登录成功！');
       router.push(backendRole === 'admin' ? '/admin-center' : '/');
